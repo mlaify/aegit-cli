@@ -1,0 +1,13 @@
+[package]
+name = "aegit-cli"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Matthew Davis"]
+
+[dependencies]
+aegis-proto = { path = "../aegis-core/crates/aegis-proto" }
+aegis-crypto = { path = "../aegis-core/crates/aegis-crypto" }
+aegis-identity = { path = "../aegis-core/crates/aegis-identity" }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
