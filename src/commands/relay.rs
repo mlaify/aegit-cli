@@ -7,6 +7,8 @@ use aegis_api_types::{FetchEnvelopeResponse, StoreEnvelopeRequest, StoreEnvelope
 use aegis_proto::Envelope;
 use clap::{Args, Subcommand};
 
+use crate::state;
+
 #[derive(Debug, Subcommand)]
 pub enum RelayCommand {
     Push(PushArgs),
@@ -36,6 +38,8 @@ pub fn run(cmd: RelayCommand) -> Result<(), Box<dyn std::error::Error>> {
         RelayCommand::Push(args) => {
             let raw = fs::read_to_string(&args.input)?;
             let envelope = Envelope::from_json(&raw)?;
+            let envelope_id = envelope.envelope_id.0.to_string();
+            let recipient_id = envelope.recipient_id.0.clone();
             let client = reqwest::blocking::Client::new();
             let url = format!("{}/v1/envelopes", args.relay.trim_end_matches('/'));
             let resp: StoreEnvelopeResponse = client
@@ -44,9 +48,11 @@ pub fn run(cmd: RelayCommand) -> Result<(), Box<dyn std::error::Error>> {
                 .send()?
                 .error_for_status()?
                 .json()?;
-            println!("accepted: {}", resp.accepted);
-            println!("relay: {}", resp.relay_id);
             println!("pushed {}", args.input);
+            println!("id {}", envelope_id);
+            println!("to {}", recipient_id);
+            println!("relay {}", resp.relay_id);
+            println!("accepted {}", resp.accepted);
         }
         RelayCommand::Fetch(args) => {
             let client = reqwest::blocking::Client::new();
@@ -57,14 +63,15 @@ pub fn run(cmd: RelayCommand) -> Result<(), Box<dyn std::error::Error>> {
             );
             let resp = client.get(url).send()?.error_for_status()?;
             let data: FetchEnvelopeResponse = resp.json()?;
-            if let Some(out) = args.out {
-                let written = write_envelopes(&out, &data.envelopes)?;
-                println!("fetched {} envelope(s) into {}", written.len(), out.display());
-                for path in written {
-                    println!("{}", path.display());
-                }
-            } else {
-                println!("{}", serde_json::to_string_pretty(&data)?);
+            let out = args
+                .out
+                .unwrap_or_else(|| state::fetched_envelope_dir(&args.recipient));
+            let written = write_envelopes(&out, &data.envelopes)?;
+            println!("fetched {}", written.len());
+            println!("recipient {}", args.recipient);
+            println!("dir {}", out.display());
+            for path in written {
+                println!("{}", path.display());
             }
         }
     }
