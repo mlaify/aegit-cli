@@ -56,6 +56,18 @@ pub fn opened_payload_path(recipient: &str, envelope_id: &str) -> PathBuf {
         .join(format!("{envelope_id}.json"))
 }
 
+pub fn identities_dir() -> PathBuf {
+    state_root().join("identities")
+}
+
+pub fn identity_doc_path(identity_id: &str) -> PathBuf {
+    identities_dir().join(format!("{}.json", sanitize_segment(identity_id)))
+}
+
+pub fn default_identity_path() -> PathBuf {
+    state_root().join("default_identity")
+}
+
 pub fn ensure_parent_dir(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -76,5 +88,19 @@ mod tests {
     #[test]
     fn sanitize_segment_falls_back_for_empty_result() {
         assert_eq!(sanitize_segment("::::"), "unknown");
+    }
+
+    #[test]
+    fn identity_doc_path_is_in_identities_directory() {
+        let path = identity_doc_path("amp:did:key:z6MkRecipient");
+        let path_str = path.to_string_lossy();
+        assert!(path_str.contains("/identities/"));
+        assert!(path_str.ends_with(".json"));
+    }
+
+    #[test]
+    fn default_identity_path_ends_with_default_identity() {
+        let path = default_identity_path();
+        assert!(path.to_string_lossy().ends_with("default_identity"));
     }
 }

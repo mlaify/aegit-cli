@@ -35,6 +35,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aegis-identity"
+version = "0.1.0"
+dependencies = [
+ "aegis-proto",
+ "thiserror",
+]
+
+[[package]]
 name = "aegis-proto"
 version = "0.1.0"
 dependencies = [
@@ -52,10 +60,12 @@ version = "0.1.0"
 dependencies = [
  "aegis-api-types",
  "aegis-crypto",
+ "aegis-identity",
  "aegis-proto",
  "clap",
  "reqwest",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]
