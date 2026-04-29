@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use aegis_crypto::{CryptoSuite, DemoSuite, EnvelopeSigner, EnvelopeVerifier};
+use aegis_crypto::{DemoSuite, EnvelopeSigner, EnvelopeVerifier, PayloadCipher};
 use aegis_identity::parse_identity_id;
 use aegis_proto::{Envelope, MessageBody, PrivateHeaders, PrivatePayload};
 use clap::{Args, Subcommand};

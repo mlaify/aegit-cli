@@ -2,6 +2,12 @@
 
 A git-flavored operator CLI for Aegis.
 
+## Protocol References
+
+- `../aegis-spec/docs/protocol-index.md`
+- `../aegis-spec/docs/implementation-conformance-v0.1.md`
+- `../aegis-docs/docs/getting-started.md` (developer onboarding)
+
 ## Commands
 
 - `aegit id init`
@@ -56,3 +62,34 @@ sh scripts/local-e2e-demo.sh
 
 - Without `--out`, it writes into the default fetched directory for that recipient.
 - With `--out <dir>`, it writes one `<envelope-id>.json` file per fetched envelope into that directory.
+
+## Current v0.1 Status
+
+CLI flows are development-oriented.
+
+- demo crypto/signing is non-production
+- no production PQ cryptography
+- no production resolver integration
+
+## Development Workflow
+
+```sh
+cargo fmt
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test
+sh scripts/local-e2e-demo.sh
+```
+
+## CI Expectations
+
+GitHub Actions runs `fmt`, `clippy`, and tests for this repo.
+
+## Protocol Change Policy
+
+- Protocol field changes MUST update RFC/schema/fixture artifacts.
+- Relay behavior changes MUST update `RFC-0004` and conformance docs.
+- Identity behavior changes MUST update `RFC-0002` and conformance docs.
+
+## Contributing
+
+See `CONTRIBUTING.md`.
