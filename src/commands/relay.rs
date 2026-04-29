@@ -4,7 +4,8 @@ use std::{
 };
 
 use aegis_api_types::{
-    EnvelopeLifecycleResponse, FetchEnvelopeResponse, StoreEnvelopeRequest, StoreEnvelopeResponse,
+    EnvelopeLifecycleResponse, FetchEnvelopeResponse, RelayCleanupResponse, StoreEnvelopeRequest,
+    StoreEnvelopeResponse,
 };
 use aegis_proto::Envelope;
 use clap::{Args, Subcommand};
@@ -17,6 +18,7 @@ pub enum RelayCommand {
     Fetch(FetchArgs),
     Ack(AckArgs),
     Delete(DeleteArgs),
+    Cleanup(CleanupArgs),
 }
 
 #[derive(Debug, Args)]
@@ -25,6 +27,8 @@ pub struct PushArgs {
     pub relay: String,
     #[arg(long)]
     pub input: String,
+    #[arg(long)]
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -45,6 +49,8 @@ pub struct AckArgs {
     pub recipient: String,
     #[arg(long)]
     pub envelope_id: String,
+    #[arg(long)]
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -55,6 +61,16 @@ pub struct DeleteArgs {
     pub recipient: String,
     #[arg(long)]
     pub envelope_id: String,
+    #[arg(long)]
+    pub token: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct CleanupArgs {
+    #[arg(long)]
+    pub relay: String,
+    #[arg(long)]
+    pub token: Option<String>,
 }
 
 pub fn run(cmd: RelayCommand) -> Result<(), Box<dyn std::error::Error>> {
@@ -66,12 +82,9 @@ pub fn run(cmd: RelayCommand) -> Result<(), Box<dyn std::error::Error>> {
             let recipient_id = envelope.recipient_id.0.clone();
             let client = reqwest::blocking::Client::new();
             let url = format!("{}/v1/envelopes", args.relay.trim_end_matches('/'));
-            let resp: StoreEnvelopeResponse = client
-                .post(url)
-                .json(&StoreEnvelopeRequest { envelope })
-                .send()?
-                .error_for_status()?
-                .json()?;
+            let req = client.post(url).json(&StoreEnvelopeRequest { envelope });
+            let req = with_token(req, args.token.as_deref());
+            let resp: StoreEnvelopeResponse = req.send()?.error_for_status()?.json()?;
             println!("pushed {}", args.input);
             println!("id {}", envelope_id);
             println!("to {}", recipient_id);
@@ -106,8 +119,8 @@ pub fn run(cmd: RelayCommand) -> Result<(), Box<dyn std::error::Error>> {
                 args.recipient,
                 args.envelope_id
             );
-            let resp: EnvelopeLifecycleResponse =
-                client.post(url).send()?.error_for_status()?.json()?;
+            let req = with_token(client.post(url), args.token.as_deref());
+            let resp: EnvelopeLifecycleResponse = req.send()?.error_for_status()?.json()?;
             println!("status {}", resp.status);
             println!("recipient {}", resp.recipient_id);
             println!("id {}", resp.envelope_id);
@@ -120,14 +133,32 @@ pub fn run(cmd: RelayCommand) -> Result<(), Box<dyn std::error::Error>> {
                 args.recipient,
                 args.envelope_id
             );
-            let resp: EnvelopeLifecycleResponse =
-                client.delete(url).send()?.error_for_status()?.json()?;
+            let req = with_token(client.delete(url), args.token.as_deref());
+            let resp: EnvelopeLifecycleResponse = req.send()?.error_for_status()?.json()?;
             println!("status {}", resp.status);
             println!("recipient {}", resp.recipient_id);
             println!("id {}", resp.envelope_id);
         }
+        RelayCommand::Cleanup(args) => {
+            let client = reqwest::blocking::Client::new();
+            let url = format!("{}/v1/cleanup", args.relay.trim_end_matches('/'));
+            let req = with_token(client.post(url), args.token.as_deref());
+            let resp: RelayCleanupResponse = req.send()?.error_for_status()?.json()?;
+            println!("expired_removed {}", resp.expired_removed);
+            println!("orphan_ack_removed {}", resp.orphan_ack_removed);
+        }
     }
     Ok(())
+}
+
+fn with_token(
+    req: reqwest::blocking::RequestBuilder,
+    token: Option<&str>,
+) -> reqwest::blocking::RequestBuilder {
+    match token {
+        Some(token) if !token.is_empty() => req.header("authorization", format!("Bearer {token}")),
+        _ => req,
+    }
 }
 
 fn write_envelopes(
@@ -181,5 +212,19 @@ mod tests {
         assert_eq!(decoded, envelope);
 
         fs::remove_dir_all(&out_dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn with_token_sets_bearer_header_when_provided() {
+        let client = reqwest::blocking::Client::new();
+        let req = with_token(client.get("http://localhost"), Some("dev-token"))
+            .build()
+            .expect("build request");
+        let auth = req
+            .headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(auth, "Bearer dev-token");
     }
 }

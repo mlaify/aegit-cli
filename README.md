@@ -20,6 +20,7 @@ A git-flavored operator CLI for Aegis.
 - `aegit relay fetch`
 - `aegit relay ack`
 - `aegit relay delete`
+- `aegit relay cleanup`
 
 ## Local state
 
@@ -69,6 +70,7 @@ sh scripts/local-e2e-demo.sh
 ## Relay workflow
 
 `aegit relay push` posts a sealed envelope JSON file to `POST /v1/envelopes`.
+When relay token support is configured, `--token` MAY be passed for compatibility.
 
 `aegit relay fetch` reads `GET /v1/envelopes/:recipient_id`.
 
@@ -76,8 +78,12 @@ sh scripts/local-e2e-demo.sh
 - With `--out <dir>`, it writes one `<envelope-id>.json` file per fetched envelope into that directory.
 
 `aegit relay ack` calls `POST /v1/envelopes/:recipient_id/:envelope_id/ack` to acknowledge an envelope without deleting ciphertext content.
+Use `--token` when relay capability token protection is enabled.
 
 `aegit relay delete` calls `DELETE /v1/envelopes/:recipient_id/:envelope_id` to remove a specific envelope file from relay storage.
+Use `--token` when relay capability token protection is enabled.
+
+`aegit relay cleanup` calls `POST /v1/cleanup` to trigger local-dev relay cleanup for expired envelopes and orphan ack markers.
 
 ## Current v0.1.0-alpha Status
 
