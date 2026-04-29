@@ -3,11 +3,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use aegis_crypto::{CryptoSuite, DemoSuite};
-use aegis_proto::{Envelope, IdentityId, MessageBody, PrivateHeaders, PrivatePayload};
+use aegis_crypto::{CryptoSuite, DemoSuite, EnvelopeSigner, EnvelopeVerifier};
+use aegis_identity::parse_identity_id;
+use aegis_proto::{Envelope, MessageBody, PrivateHeaders, PrivatePayload};
 use clap::{Args, Subcommand};
 
-use crate::state;
+use crate::{commands::identity, state};
 
 #[derive(Debug, Subcommand)]
 pub enum MessageCommand {
@@ -52,6 +53,26 @@ pub fn run(cmd: MessageCommand) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         MessageCommand::Seal(args) => {
             let suite = DemoSuite::from_passphrase(&args.passphrase);
+            let recipient_id = parse_identity_id(&args.to)
+                .map_err(|_| format!("invalid recipient identity id: {}", args.to))?;
+            let sender_hint = match args.from {
+                Some(from) => Some(
+                    parse_identity_id(&from)
+                        .map_err(|_| format!("invalid sender identity id: {}", from))?,
+                ),
+                None => match identity::read_default_identity_id()? {
+                    Some(id) => Some(
+                        parse_identity_id(&id)
+                            .map_err(|_| format!("invalid default identity id: {}", id))?,
+                    ),
+                    None => {
+                        return Err(
+                            "no sender identity provided and no default identity configured; run `aegit id init` or pass `--from`"
+                                .into(),
+                        )
+                    }
+                },
+            };
 
             let payload = PrivatePayload {
                 private_headers: PrivateHeaders {
@@ -68,15 +89,18 @@ pub fn run(cmd: MessageCommand) -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let encrypted = suite.encrypt_payload(&payload)?;
-            let envelope = Envelope::new(
-                IdentityId(args.to),
-                args.from.map(IdentityId),
-                suite.suite_id(),
-                encrypted,
-            );
+            let mut envelope =
+                Envelope::new(recipient_id, sender_hint, suite.suite_id(), encrypted);
+            if envelope.sender_hint.is_some() {
+                let signature = suite.sign_envelope(&envelope)?;
+                envelope.outer_signature_b64 = Some(signature);
+            }
 
             let out = args.out.unwrap_or_else(|| {
-                state::sealed_envelope_path(&envelope.recipient_id.0, &envelope.envelope_id.0.to_string())
+                state::sealed_envelope_path(
+                    &envelope.recipient_id.0,
+                    &envelope.envelope_id.0.to_string(),
+                )
             });
             state::ensure_parent_dir(&out)?;
             fs::write(&out, envelope.to_json_pretty()?)?;
@@ -88,6 +112,12 @@ pub fn run(cmd: MessageCommand) -> Result<(), Box<dyn std::error::Error>> {
             let suite = DemoSuite::from_passphrase(&args.passphrase);
             let raw = fs::read_to_string(&args.input)?;
             let envelope = Envelope::from_json(&raw)?;
+            if let Some(signature) = envelope.outer_signature_b64.as_deref() {
+                suite.verify_envelope(&envelope, signature)?;
+                println!("signature verified");
+            } else {
+                println!("signature <none>");
+            }
             let payload = suite.decrypt_payload(&envelope.payload)?;
             let out = args.out.unwrap_or_else(|| {
                 state::opened_payload_path(
@@ -104,11 +134,19 @@ pub fn run(cmd: MessageCommand) -> Result<(), Box<dyn std::error::Error>> {
             println!("to {}", envelope.recipient_id.0);
             println!(
                 "from {}",
-                envelope.sender_hint.as_ref().map(|i| i.0.as_str()).unwrap_or("<anonymous>")
+                envelope
+                    .sender_hint
+                    .as_ref()
+                    .map(|i| i.0.as_str())
+                    .unwrap_or("<anonymous>")
             );
             println!(
                 "subject {}",
-                payload.private_headers.subject.as_deref().unwrap_or("<none>")
+                payload
+                    .private_headers
+                    .subject
+                    .as_deref()
+                    .unwrap_or("<none>")
             );
             println!("{}", payload.body.content);
         }
@@ -158,7 +196,7 @@ fn envelope_path(dir: &Path, envelope_id: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aegis_proto::{EncryptedBlob, SuiteId};
+    use aegis_proto::{EncryptedBlob, IdentityId, SuiteId};
 
     fn sample_envelope(recipient: &str, id_suffix: &str) -> Envelope {
         let mut envelope = Envelope::new(

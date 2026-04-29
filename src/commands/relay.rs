@@ -113,10 +113,8 @@ mod tests {
 
     #[test]
     fn write_envelopes_persists_one_file_per_envelope() {
-        let out_dir = std::env::temp_dir().join(format!(
-            "aegit-cli-fetch-test-{}",
-            std::process::id()
-        ));
+        let out_dir =
+            std::env::temp_dir().join(format!("aegit-cli-fetch-test-{}", std::process::id()));
         if out_dir.exists() {
             fs::remove_dir_all(&out_dir).expect("clear temp dir");
         }
