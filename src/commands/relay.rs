@@ -3,7 +3,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use aegis_api_types::{FetchEnvelopeResponse, StoreEnvelopeRequest, StoreEnvelopeResponse};
+use aegis_api_types::{
+    EnvelopeLifecycleResponse, FetchEnvelopeResponse, StoreEnvelopeRequest, StoreEnvelopeResponse,
+};
 use aegis_proto::Envelope;
 use clap::{Args, Subcommand};
 
@@ -13,6 +15,8 @@ use crate::state;
 pub enum RelayCommand {
     Push(PushArgs),
     Fetch(FetchArgs),
+    Ack(AckArgs),
+    Delete(DeleteArgs),
 }
 
 #[derive(Debug, Args)]
@@ -31,6 +35,26 @@ pub struct FetchArgs {
     pub recipient: String,
     #[arg(long)]
     pub out: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct AckArgs {
+    #[arg(long)]
+    pub relay: String,
+    #[arg(long)]
+    pub recipient: String,
+    #[arg(long)]
+    pub envelope_id: String,
+}
+
+#[derive(Debug, Args)]
+pub struct DeleteArgs {
+    #[arg(long)]
+    pub relay: String,
+    #[arg(long)]
+    pub recipient: String,
+    #[arg(long)]
+    pub envelope_id: String,
 }
 
 pub fn run(cmd: RelayCommand) -> Result<(), Box<dyn std::error::Error>> {
@@ -73,6 +97,34 @@ pub fn run(cmd: RelayCommand) -> Result<(), Box<dyn std::error::Error>> {
             for path in written {
                 println!("{}", path.display());
             }
+        }
+        RelayCommand::Ack(args) => {
+            let client = reqwest::blocking::Client::new();
+            let url = format!(
+                "{}/v1/envelopes/{}/{}/ack",
+                args.relay.trim_end_matches('/'),
+                args.recipient,
+                args.envelope_id
+            );
+            let resp: EnvelopeLifecycleResponse =
+                client.post(url).send()?.error_for_status()?.json()?;
+            println!("status {}", resp.status);
+            println!("recipient {}", resp.recipient_id);
+            println!("id {}", resp.envelope_id);
+        }
+        RelayCommand::Delete(args) => {
+            let client = reqwest::blocking::Client::new();
+            let url = format!(
+                "{}/v1/envelopes/{}/{}",
+                args.relay.trim_end_matches('/'),
+                args.recipient,
+                args.envelope_id
+            );
+            let resp: EnvelopeLifecycleResponse =
+                client.delete(url).send()?.error_for_status()?.json()?;
+            println!("status {}", resp.status);
+            println!("recipient {}", resp.recipient_id);
+            println!("id {}", resp.envelope_id);
         }
     }
     Ok(())

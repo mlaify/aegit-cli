@@ -4,6 +4,7 @@ use std::{
 };
 
 use aegis_crypto::{DemoSuite, EnvelopeSigner, EnvelopeVerifier, PayloadCipher};
+use aegis_identity::decode_local_dev_signing_key;
 use aegis_identity::parse_identity_id;
 use aegis_proto::{Envelope, MessageBody, PrivateHeaders, PrivatePayload};
 use clap::{Args, Subcommand};
@@ -92,7 +93,11 @@ pub fn run(cmd: MessageCommand) -> Result<(), Box<dyn std::error::Error>> {
             let mut envelope =
                 Envelope::new(recipient_id, sender_hint, suite.suite_id(), encrypted);
             if envelope.sender_hint.is_some() {
-                let signature = suite.sign_envelope(&envelope)?;
+                let sender_identity = envelope.sender_hint.as_ref().expect("checked above");
+                let signing_material = identity::read_signing_key_material(&sender_identity.0)?;
+                let signing_key = decode_local_dev_signing_key(&signing_material)?;
+                let signing_suite = DemoSuite::from_signing_key_bytes(&signing_key)?;
+                let signature = signing_suite.sign_envelope(&envelope)?;
                 envelope.outer_signature_b64 = Some(signature);
             }
 
@@ -112,11 +117,10 @@ pub fn run(cmd: MessageCommand) -> Result<(), Box<dyn std::error::Error>> {
             let suite = DemoSuite::from_passphrase(&args.passphrase);
             let raw = fs::read_to_string(&args.input)?;
             let envelope = Envelope::from_json(&raw)?;
-            if let Some(signature) = envelope.outer_signature_b64.as_deref() {
-                suite.verify_envelope(&envelope, signature)?;
-                println!("signature verified");
-            } else {
-                println!("signature <none>");
+            let signature_status = signature_status(&envelope);
+            println!("signature_status {}", signature_status.label());
+            if let Some(reason) = signature_status.reason() {
+                println!("signature_detail {}", reason);
             }
             let payload = suite.decrypt_payload(&envelope.payload)?;
             let out = args.out.unwrap_or_else(|| {
@@ -168,6 +172,79 @@ pub fn run(cmd: MessageCommand) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+enum SignatureStatus {
+    Unsigned,
+    Verified,
+    Failed(String),
+    Unavailable(String),
+}
+
+impl SignatureStatus {
+    fn label(&self) -> &'static str {
+        match self {
+            SignatureStatus::Unsigned => "unsigned",
+            SignatureStatus::Verified => "present_verified",
+            SignatureStatus::Failed(_) => "present_failed",
+            SignatureStatus::Unavailable(_) => "verification_unavailable",
+        }
+    }
+
+    fn reason(&self) -> Option<&str> {
+        match self {
+            SignatureStatus::Failed(reason) | SignatureStatus::Unavailable(reason) => {
+                Some(reason.as_str())
+            }
+            SignatureStatus::Unsigned | SignatureStatus::Verified => None,
+        }
+    }
+}
+
+fn signature_status(envelope: &Envelope) -> SignatureStatus {
+    let Some(signature) = envelope.outer_signature_b64.as_deref() else {
+        return SignatureStatus::Unsigned;
+    };
+
+    let sender = match envelope.sender_hint.as_ref() {
+        Some(sender) => sender,
+        None => {
+            return SignatureStatus::Unavailable(
+                "signature present but sender_hint missing".to_string(),
+            )
+        }
+    };
+
+    let sender_doc = match identity::read_identity_document(&sender.0) {
+        Ok(doc) => doc,
+        Err(err) => {
+            return SignatureStatus::Unavailable(format!(
+                "sender identity document unavailable: {}",
+                err
+            ))
+        }
+    };
+
+    let signing_key = match sender_doc.signing_keys.first() {
+        Some(signing_key) => signing_key,
+        None => {
+            return SignatureStatus::Unavailable(
+                "sender identity has no signing key records".to_string(),
+            )
+        }
+    };
+
+    let verify_suite = match DemoSuite::from_signing_key_b64(&signing_key.public_key_b64) {
+        Ok(suite) => suite,
+        Err(err) => {
+            return SignatureStatus::Unavailable(format!("invalid signing key metadata: {}", err))
+        }
+    };
+
+    match verify_suite.verify_envelope(envelope, signature) {
+        Ok(()) => SignatureStatus::Verified,
+        Err(err) => SignatureStatus::Failed(err.to_string()),
+    }
 }
 
 fn read_fetched_envelopes(dir: &Path) -> Result<Vec<Envelope>, Box<dyn std::error::Error>> {
@@ -233,5 +310,20 @@ mod tests {
         assert_eq!(envelopes[0].recipient_id.0, "amp:did:key:z6MkRecipient");
 
         fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn signature_status_reports_unsigned() {
+        let envelope = sample_envelope("amp:did:key:z6MkRecipient", "unsigned");
+        let status = signature_status(&envelope);
+        assert_eq!(status.label(), "unsigned");
+    }
+
+    #[test]
+    fn signature_status_reports_unavailable_without_sender_hint() {
+        let mut envelope = sample_envelope("amp:did:key:z6MkRecipient", "signed");
+        envelope.outer_signature_b64 = Some("c2ln".to_string());
+        let status = signature_status(&envelope);
+        assert_eq!(status.label(), "verification_unavailable");
     }
 }

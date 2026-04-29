@@ -1,7 +1,11 @@
 use std::fs;
 
-use aegis_identity::parse_identity_id;
-use aegis_proto::{IdentityDocument, IdentityId};
+use aegis_identity::{
+    decode_local_dev_signing_key, generate_local_dev_signing_key_material,
+    local_dev_public_key_b64, parse_identity_id, LocalDevSigningKeyMaterial,
+    LOCAL_DEV_SIGNING_ALGORITHM,
+};
+use aegis_proto::{IdentityDocument, IdentityId, PublicKeyRecord};
 use clap::{Args, Subcommand};
 use uuid::Uuid;
 
@@ -31,11 +35,17 @@ pub fn run(cmd: IdentityCommand) -> Result<(), Box<dyn std::error::Error>> {
         IdentityCommand::Init(args) => {
             let id = IdentityId(format!("amp:did:key:local-{}", Uuid::new_v4().simple()));
             let alias_list = args.alias.into_iter().collect::<Vec<_>>();
+            let signing_key = generate_local_dev_signing_key_material("sig-local-dev-1");
+            let signing_public_b64 = local_dev_public_key_b64(&signing_key)?;
             let identity_doc = IdentityDocument {
                 version: 1,
                 identity_id: id.clone(),
                 aliases: alias_list,
-                signing_keys: vec![],
+                signing_keys: vec![PublicKeyRecord {
+                    key_id: signing_key.key_id.clone(),
+                    algorithm: LOCAL_DEV_SIGNING_ALGORITHM.to_string(),
+                    public_key_b64: signing_public_b64,
+                }],
                 encryption_keys: vec![],
                 supported_suites: vec!["AMP-DEMO-XCHACHA20POLY1305".to_string()],
                 relay_endpoints: vec![],
@@ -50,10 +60,18 @@ pub fn run(cmd: IdentityCommand) -> Result<(), Box<dyn std::error::Error>> {
             state::ensure_parent_dir(&default_path)?;
             fs::write(&default_path, format!("{}\n", id.0))?;
 
+            let signing_key_path = state::signing_key_material_path(&id.0);
+            state::ensure_parent_dir(&signing_key_path)?;
+            fs::write(
+                &signing_key_path,
+                serde_json::to_string_pretty(&signing_key)?,
+            )?;
+
             println!("initialized local identity");
             println!("identity {}", id.0);
             println!("stored {}", identity_path.display());
             println!("default {}", default_path.display());
+            println!("signing_key {}", signing_key_path.display());
             if !identity_doc.aliases.is_empty() {
                 println!("aliases {}", identity_doc.aliases.join(","));
             }
@@ -77,6 +95,14 @@ pub fn run(cmd: IdentityCommand) -> Result<(), Box<dyn std::error::Error>> {
             println!("signing_keys {}", doc.signing_keys.len());
             println!("encryption_keys {}", doc.encryption_keys.len());
             println!("signature {}", doc.signature.as_deref().unwrap_or("<none>"));
+            println!(
+                "local_signing_key {}",
+                if read_signing_key_material(&doc.identity_id.0).is_ok() {
+                    "present"
+                } else {
+                    "<none>"
+                }
+            );
         }
         IdentityCommand::List => {
             let docs = list_identity_documents()?;
@@ -126,6 +152,24 @@ pub fn read_identity_document(
     let doc: IdentityDocument = serde_json::from_str(&raw)
         .map_err(|e| format!("invalid identity document {}: {}", path.display(), e))?;
     Ok(doc)
+}
+
+pub fn read_signing_key_material(
+    identity_id: &str,
+) -> Result<LocalDevSigningKeyMaterial, Box<dyn std::error::Error>> {
+    let path = state::signing_key_material_path(identity_id);
+    let raw = fs::read_to_string(&path).map_err(|e| {
+        format!(
+            "failed to read signing key material {}: {}",
+            path.display(),
+            e
+        )
+    })?;
+    let material: LocalDevSigningKeyMaterial = serde_json::from_str(&raw)
+        .map_err(|e| format!("invalid signing key material {}: {}", path.display(), e))?;
+    decode_local_dev_signing_key(&material)
+        .map_err(|e| format!("invalid signing key material {}: {}", path.display(), e))?;
+    Ok(material)
 }
 
 fn list_identity_documents() -> Result<Vec<IdentityDocument>, Box<dyn std::error::Error>> {

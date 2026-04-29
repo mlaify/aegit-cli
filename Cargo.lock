@@ -39,6 +39,9 @@ name = "aegis-identity"
 version = "0.1.0"
 dependencies = [
  "aegis-proto",
+ "base64",
+ "rand",
+ "serde",
  "thiserror",
 ]
 

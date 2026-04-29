@@ -18,6 +18,8 @@ A git-flavored operator CLI for Aegis.
 - `aegit msg list`
 - `aegit relay push`
 - `aegit relay fetch`
+- `aegit relay ack`
+- `aegit relay delete`
 
 ## Local state
 
@@ -46,6 +48,16 @@ Default locations:
 
 `aegit msg seal` uses `--from` when provided. If omitted, it uses the default local identity. If no default identity exists, it returns a helpful error prompting `aegit id init`.
 
+Local-dev identity signing behavior:
+
+- `id init` creates identity-linked local signing key material in local state.
+- `msg seal` signs with that identity-linked local-dev key material.
+- `msg open` reports explicit signature status:
+  - `unsigned`
+  - `present_verified`
+  - `present_failed`
+  - `verification_unavailable`
+
 ## Local E2E Demo
 
 See [DEV-SETUP.md](./DEV-SETUP.md) for a repeatable local end-to-end workflow and smoke script:
@@ -62,6 +74,10 @@ sh scripts/local-e2e-demo.sh
 
 - Without `--out`, it writes into the default fetched directory for that recipient.
 - With `--out <dir>`, it writes one `<envelope-id>.json` file per fetched envelope into that directory.
+
+`aegit relay ack` calls `POST /v1/envelopes/:recipient_id/:envelope_id/ack` to acknowledge an envelope without deleting ciphertext content.
+
+`aegit relay delete` calls `DELETE /v1/envelopes/:recipient_id/:envelope_id` to remove a specific envelope file from relay storage.
 
 ## Current v0.1.0-alpha Status
 
