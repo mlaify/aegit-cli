@@ -1,4 +1,5 @@
 use std::{
+    cmp::Reverse,
     fs,
     path::{Path, PathBuf},
 };
@@ -92,8 +93,7 @@ pub fn run(cmd: MessageCommand) -> Result<(), Box<dyn std::error::Error>> {
             let encrypted = suite.encrypt_payload(&payload)?;
             let mut envelope =
                 Envelope::new(recipient_id, sender_hint, suite.suite_id(), encrypted);
-            if envelope.sender_hint.is_some() {
-                let sender_identity = envelope.sender_hint.as_ref().expect("checked above");
+            if let Some(sender_identity) = envelope.sender_hint.as_ref() {
                 let signing_material = identity::read_signing_key_material(&sender_identity.0)?;
                 let signing_key = decode_local_dev_signing_key(&signing_material)?;
                 let signing_suite = DemoSuite::from_signing_key_bytes(&signing_key)?;
@@ -262,7 +262,7 @@ fn read_fetched_envelopes(dir: &Path) -> Result<Vec<Envelope>, Box<dyn std::erro
         out.push(Envelope::from_json(&raw)?);
     }
 
-    out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    out.sort_by_key(|envelope| Reverse(envelope.created_at));
     Ok(out)
 }
 
