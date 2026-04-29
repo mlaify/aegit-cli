@@ -63,9 +63,9 @@ sh scripts/local-e2e-demo.sh
 - Without `--out`, it writes into the default fetched directory for that recipient.
 - With `--out <dir>`, it writes one `<envelope-id>.json` file per fetched envelope into that directory.
 
-## Current v0.1 Status
+## Current v0.1.0-alpha Status
 
-CLI flows are development-oriented.
+CLI flows for `v0.1.0-alpha` are development-oriented.
 
 - demo crypto/signing is non-production
 - no production PQ cryptography
