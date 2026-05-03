@@ -72,8 +72,8 @@ fn read_identity_document_opt(identity_id: &str) -> Option<aegis_proto::Identity
 }
 
 fn seal(args: SealArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let recipient_id = parse_identity_id(&args.to)
-        .map_err(|_| format!("invalid recipient identity id: {}", args.to))?;
+    let (recipient_id, resolved_recipient_doc) =
+        resolve_recipient_target(&args.to, args.relay.as_deref())?;
 
     let sender_hint = resolve_sender(args.from)?;
 
@@ -92,27 +92,28 @@ fn seal(args: SealArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Try local store first; fall back to relay if a URL is configured.
-    let recipient_doc_opt = match read_identity_document_opt(&recipient_id.0) {
-        Some(doc) => Some(doc),
-        None => {
-            let relay_url = args.relay.clone();
-            match relay_url {
-                Some(url) => {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()?;
-                    Some(
-                        rt.block_on(aegis_identity::resolver::resolve_identity(
-                            &url,
-                            &recipient_id.0,
-                        ))
-                        .map_err(|e| format!("could not resolve recipient identity: {}", e))?,
-                    )
+    let recipient_doc_opt =
+        match resolved_recipient_doc.or_else(|| read_identity_document_opt(&recipient_id.0)) {
+            Some(doc) => Some(doc),
+            None => {
+                let relay_url = args.relay.clone();
+                match relay_url {
+                    Some(url) => {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()?;
+                        Some(
+                            rt.block_on(aegis_identity::resolver::resolve_identity(
+                                &url,
+                                &recipient_id.0,
+                            ))
+                            .map_err(|e| format!("could not resolve recipient identity: {}", e))?,
+                        )
+                    }
+                    None => None,
                 }
-                None => None,
             }
-        }
-    };
+        };
 
     let recipient_doc = recipient_doc_opt;
     let supports_pq = recipient_doc
@@ -196,6 +197,30 @@ fn seal(args: SealArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn resolve_recipient_target(
+    to: &str,
+    relay: Option<&str>,
+) -> Result<(IdentityId, Option<aegis_proto::IdentityDocument>), Box<dyn std::error::Error>> {
+    if let Ok(id) = parse_identity_id(to) {
+        return Ok((id, None));
+    }
+
+    let relay_url = relay.ok_or_else(|| {
+        format!(
+            "recipient '{}' is not a valid identity id; pass --relay to resolve aliases",
+            to
+        )
+    })?;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let doc = rt
+        .block_on(aegis_identity::resolver::resolve_alias(relay_url, to))
+        .map_err(|e| format!("could not resolve recipient alias '{}': {}", to, e))?;
+    Ok((doc.identity_id.clone(), Some(doc)))
 }
 
 fn write_envelope(

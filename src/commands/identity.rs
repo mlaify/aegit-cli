@@ -228,6 +228,15 @@ fn publish(args: PublishArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     sign_identity_document(&mut doc, &ed25519_seed, &dilithium3_sk)?;
 
+    // Persist the signed document locally so future operations see the signature.
+    fs::write(&doc_path, serde_json::to_string_pretty(&doc)?).map_err(|e| {
+        format!(
+            "failed to write signed identity document {}: {}",
+            doc_path.display(),
+            e
+        )
+    })?;
+
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -237,7 +246,8 @@ fn publish(args: PublishArgs) -> Result<(), Box<dyn std::error::Error>> {
     ))?;
 
     println!("published {}", doc.identity_id.0);
-    println!("relay    {}", args.relay);
+    println!("relay     {}", args.relay);
+    println!("signed    {}", doc_path.display());
     Ok(())
 }
 
