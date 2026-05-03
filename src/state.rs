@@ -75,6 +75,10 @@ pub fn signing_key_material_path(identity_id: &str) -> PathBuf {
     ))
 }
 
+pub fn pq_key_material_path(identity_id: &str) -> PathBuf {
+    identities_dir().join(format!("{}.pq-key.json", sanitize_segment(identity_id)))
+}
+
 pub fn ensure_parent_dir(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
