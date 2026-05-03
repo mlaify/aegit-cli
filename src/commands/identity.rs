@@ -1,11 +1,13 @@
 use std::fs;
 
+use aegis_crypto::HybridPqKeyBundle;
 use aegis_identity::{
-    decode_local_dev_signing_key, generate_local_dev_signing_key_material,
-    local_dev_public_key_b64, parse_identity_id, LocalDevSigningKeyMaterial,
-    LOCAL_DEV_SIGNING_ALGORITHM,
+    decode_local_dev_signing_key, generate_local_dev_signing_key_material, parse_identity_id,
+    HybridPqPrivateKeyMaterial, LocalDevSigningKeyMaterial, ALG_ED25519, ALG_MLDSA65, ALG_MLKEM768,
+    ALG_X25519, SUITE_HYBRID_PQ,
 };
 use aegis_proto::{IdentityDocument, IdentityId, PublicKeyRecord};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::{Args, Subcommand};
 use uuid::Uuid;
 
@@ -22,6 +24,10 @@ pub enum IdentityCommand {
 pub struct InitArgs {
     #[arg(long)]
     pub alias: Option<String>,
+    /// Generate legacy demo signing key material in addition to hybrid PQ keys.
+    /// Only needed when interoperating with v0.1 local development tooling.
+    #[arg(long, default_value_t = false)]
+    pub include_demo_key: bool,
 }
 
 #[derive(Debug, Args)]
@@ -35,43 +41,85 @@ pub fn run(cmd: IdentityCommand) -> Result<(), Box<dyn std::error::Error>> {
         IdentityCommand::Init(args) => {
             let id = IdentityId(format!("amp:did:key:local-{}", Uuid::new_v4().simple()));
             let alias_list = args.alias.into_iter().collect::<Vec<_>>();
-            let signing_key = generate_local_dev_signing_key_material("sig-local-dev-1");
-            let signing_public_b64 = local_dev_public_key_b64(&signing_key)?;
+
+            // --- Generate hybrid PQ key bundle ---
+            let bundle = HybridPqKeyBundle::generate();
+
+            let pq_material = HybridPqPrivateKeyMaterial {
+                identity_id: id.0.clone(),
+                algorithm: HybridPqPrivateKeyMaterial::algorithm_marker().to_string(),
+                x25519_private_key_b64: STANDARD.encode(bundle.x25519_private_key_bytes),
+                kyber768_secret_key_b64: STANDARD.encode(&bundle.kyber768_secret_key_bytes),
+                ed25519_signing_seed_b64: STANDARD.encode(bundle.ed25519_signing_seed_bytes),
+                dilithium3_secret_key_b64: STANDARD.encode(&bundle.dilithium3_secret_key_bytes),
+            };
+
             let identity_doc = IdentityDocument {
                 version: 1,
                 identity_id: id.clone(),
                 aliases: alias_list,
-                signing_keys: vec![PublicKeyRecord {
-                    key_id: signing_key.key_id.clone(),
-                    algorithm: LOCAL_DEV_SIGNING_ALGORITHM.to_string(),
-                    public_key_b64: signing_public_b64,
-                }],
-                encryption_keys: vec![],
-                supported_suites: vec!["AMP-DEMO-XCHACHA20POLY1305".to_string()],
+                signing_keys: vec![
+                    PublicKeyRecord {
+                        key_id: "sig-ed25519-1".to_string(),
+                        algorithm: ALG_ED25519.to_string(),
+                        public_key_b64: bundle.ed25519_verifying_key_b64(),
+                    },
+                    PublicKeyRecord {
+                        key_id: "sig-mldsa65-1".to_string(),
+                        algorithm: ALG_MLDSA65.to_string(),
+                        public_key_b64: bundle.dilithium3_public_key_b64(),
+                    },
+                ],
+                encryption_keys: vec![
+                    PublicKeyRecord {
+                        key_id: "enc-x25519-1".to_string(),
+                        algorithm: ALG_X25519.to_string(),
+                        public_key_b64: bundle.x25519_public_key_b64(),
+                    },
+                    PublicKeyRecord {
+                        key_id: "enc-mlkem768-1".to_string(),
+                        algorithm: ALG_MLKEM768.to_string(),
+                        public_key_b64: bundle.kyber768_public_key_b64(),
+                    },
+                ],
+                supported_suites: vec![SUITE_HYBRID_PQ.to_string()],
                 relay_endpoints: vec![],
                 signature: None,
             };
 
+            // Persist identity document
             let identity_path = state::identity_doc_path(&id.0);
             state::ensure_parent_dir(&identity_path)?;
             fs::write(&identity_path, serde_json::to_string_pretty(&identity_doc)?)?;
 
+            // Persist hybrid PQ private key material
+            let pq_key_path = state::pq_key_material_path(&id.0);
+            state::ensure_parent_dir(&pq_key_path)?;
+            fs::write(&pq_key_path, serde_json::to_string_pretty(&pq_material)?)?;
+
+            // Set as default identity
             let default_path = state::default_identity_path();
             state::ensure_parent_dir(&default_path)?;
             fs::write(&default_path, format!("{}\n", id.0))?;
 
-            let signing_key_path = state::signing_key_material_path(&id.0);
-            state::ensure_parent_dir(&signing_key_path)?;
-            fs::write(
-                &signing_key_path,
-                serde_json::to_string_pretty(&signing_key)?,
-            )?;
+            // Optionally write legacy demo signing key for v0.1 compat
+            if args.include_demo_key {
+                let signing_key = generate_local_dev_signing_key_material("sig-local-dev-1");
+                let signing_key_path = state::signing_key_material_path(&id.0);
+                state::ensure_parent_dir(&signing_key_path)?;
+                fs::write(
+                    &signing_key_path,
+                    serde_json::to_string_pretty(&signing_key)?,
+                )?;
+                println!("demo_signing_key {}", signing_key_path.display());
+            }
 
-            println!("initialized local identity");
+            println!("initialized hybrid PQ identity");
             println!("identity {}", id.0);
+            println!("suite {}", SUITE_HYBRID_PQ);
             println!("stored {}", identity_path.display());
+            println!("pq_key {}", pq_key_path.display());
             println!("default {}", default_path.display());
-            println!("signing_key {}", signing_key_path.display());
             if !identity_doc.aliases.is_empty() {
                 println!("aliases {}", identity_doc.aliases.join(","));
             }
@@ -96,7 +144,15 @@ pub fn run(cmd: IdentityCommand) -> Result<(), Box<dyn std::error::Error>> {
             println!("encryption_keys {}", doc.encryption_keys.len());
             println!("signature {}", doc.signature.as_deref().unwrap_or("<none>"));
             println!(
-                "local_signing_key {}",
+                "pq_key_material {}",
+                if read_pq_key_material(&doc.identity_id.0).is_ok() {
+                    "present"
+                } else {
+                    "<none>"
+                }
+            );
+            println!(
+                "demo_signing_key {}",
                 if read_signing_key_material(&doc.identity_id.0).is_ok() {
                     "present"
                 } else {
@@ -154,6 +210,17 @@ pub fn read_identity_document(
     Ok(doc)
 }
 
+pub fn read_pq_key_material(
+    identity_id: &str,
+) -> Result<HybridPqPrivateKeyMaterial, Box<dyn std::error::Error>> {
+    let path = state::pq_key_material_path(identity_id);
+    let raw = fs::read_to_string(&path)
+        .map_err(|e| format!("failed to read PQ key material {}: {}", path.display(), e))?;
+    let material: HybridPqPrivateKeyMaterial = serde_json::from_str(&raw)
+        .map_err(|e| format!("invalid PQ key material {}: {}", path.display(), e))?;
+    Ok(material)
+}
+
 pub fn read_signing_key_material(
     identity_id: &str,
 ) -> Result<LocalDevSigningKeyMaterial, Box<dyn std::error::Error>> {
@@ -182,6 +249,14 @@ fn list_identity_documents() -> Result<Vec<IdentityDocument>, Box<dyn std::error
     for entry in fs::read_dir(&dir)? {
         let path = entry?.path();
         if path.extension().and_then(|v| v.to_str()) != Some("json") {
+            continue;
+        }
+        // Skip key material files — only read identity documents
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if filename.contains(".signing-key") || filename.contains(".pq-key") {
             continue;
         }
         let raw = fs::read_to_string(path)?;
