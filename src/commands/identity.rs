@@ -18,6 +18,15 @@ pub enum IdentityCommand {
     Init(InitArgs),
     Show(ShowArgs),
     List,
+    Publish(PublishArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PublishArgs {
+    #[arg(long, env = "AEGIS_RELAY_URL")]
+    pub relay: String,
+    #[arg(long)]
+    pub identity: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -38,6 +47,7 @@ pub struct ShowArgs {
 
 pub fn run(cmd: IdentityCommand) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
+        IdentityCommand::Publish(args) => publish(args)?,
         IdentityCommand::Init(args) => {
             let id = IdentityId(format!("amp:did:key:local-{}", Uuid::new_v4().simple()));
             let alias_list = args.alias.into_iter().collect::<Vec<_>>();
@@ -182,6 +192,62 @@ pub fn run(cmd: IdentityCommand) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    Ok(())
+}
+
+fn publish(args: PublishArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use aegis_identity::sign_identity_document;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    let identity_id = match args.identity {
+        Some(id) => id,
+        None => {
+            let path = state::default_identity_path();
+            fs::read_to_string(path)?.trim().to_string()
+        }
+    };
+
+    let doc_path = state::identity_doc_path(&identity_id);
+    let raw = fs::read_to_string(&doc_path).map_err(|e| {
+        format!(
+            "failed to read identity document {}: {}",
+            doc_path.display(),
+            e
+        )
+    })?;
+    let mut doc: aegis_proto::IdentityDocument = serde_json::from_str(&raw)
+        .map_err(|e| format!("invalid identity document {}: {}", doc_path.display(), e))?;
+
+    let pq_material = read_pq_key_material(&identity_id)?;
+
+    let ed25519_seed: [u8; 32] = STANDARD
+        .decode(&pq_material.ed25519_signing_seed_b64)?
+        .try_into()
+        .map_err(|_| "invalid ed25519 seed length")?;
+    let dilithium3_sk = STANDARD.decode(&pq_material.dilithium3_secret_key_b64)?;
+
+    sign_identity_document(&mut doc, &ed25519_seed, &dilithium3_sk)?;
+
+    // Persist the signed document locally so future operations see the signature.
+    fs::write(&doc_path, serde_json::to_string_pretty(&doc)?).map_err(|e| {
+        format!(
+            "failed to write signed identity document {}: {}",
+            doc_path.display(),
+            e
+        )
+    })?;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(aegis_identity::resolver::publish_identity(
+        &args.relay,
+        &doc,
+    ))?;
+
+    println!("published {}", doc.identity_id.0);
+    println!("relay     {}", args.relay);
+    println!("signed    {}", doc_path.display());
     Ok(())
 }
 

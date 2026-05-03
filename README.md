@@ -48,6 +48,7 @@ Default locations:
 - `aegit id list` lists stored identities and marks the default.
 
 `aegit msg seal` uses `--from` when provided. If omitted, it uses the default local identity. If no default identity exists, it returns a helpful error prompting `aegit id init`.
+When `--to` is not a canonical `IdentityId`, `aegit msg seal --relay <url>` can resolve aliases via relay resolver endpoint.
 
 Local-dev identity signing behavior:
 
@@ -91,7 +92,7 @@ CLI flows for `v0.1.0-alpha` are development-oriented.
 
 - demo crypto/signing is non-production
 - no production PQ cryptography
-- no production resolver integration
+- resolver integration is available through relay-backed identity/alias endpoints; production trust policy remains in-progress
 
 ## Development Workflow
 
