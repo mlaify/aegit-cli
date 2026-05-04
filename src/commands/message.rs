@@ -714,8 +714,23 @@ mod tests {
     // ----- Phase 3: prekey-secrets persistence helpers -----
 
     use aegis_identity::OneTimePrekeySecret;
+    use std::sync::Mutex;
 
-    fn isolated_state_dir(tag: &str) -> PathBuf {
+    /// Serializes `AEGIT_STATE_DIR` env-var manipulation. Cargo runs tests in
+    /// parallel; without this lock concurrent tests would step on each other's
+    /// state-dir setting and race to read/write the same files.
+    static STATE_DIR_LOCK: Mutex<()> = Mutex::new(());
+
+    /// RAII guard that holds the env-var lock until dropped, so the `#[test]`
+    /// body's reads of `state::prekey_secrets_path()` always see the value we
+    /// just set rather than another concurrent test's value.
+    struct StateDirGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _path: PathBuf,
+    }
+
+    fn isolated_state_dir(tag: &str) -> StateDirGuard {
+        let lock = STATE_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let path = std::env::temp_dir().join(format!(
             "aegit-prekey-test-{}-{}-{}",
             tag,
@@ -723,7 +738,10 @@ mod tests {
             uuid_simple()
         ));
         std::env::set_var("AEGIT_STATE_DIR", &path);
-        path
+        StateDirGuard {
+            _lock: lock,
+            _path: path,
+        }
     }
 
     fn uuid_simple() -> String {
