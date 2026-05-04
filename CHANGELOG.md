@@ -4,7 +4,14 @@ All notable changes to this repository are documented here.
 
 ## [Unreleased]
 
-- Ongoing `v0.2.0-alpha` stabilization.
+### v0.3.0-alpha — phase 2 (prekey publish + atomic claim)
+
+- New `aegit id publish-prekeys --relay <url> [--count N=10] [--identity <id>]` command:
+  - Generates `count` fresh ML-KEM-768 one-time prekeys via `aegis-identity::generate_prekey_bundle()`.
+  - Signs the bundle in place using the identity's existing hybrid PQ signing keys.
+  - Persists private halves to `<id>.prekey-secrets.json` (append-merging across runs so the local pool grows; secrets are written BEFORE the network call so a failed publish doesn't lose key material that may already be on the relay).
+  - POSTs the signed bundle to the relay's `POST /v1/identities/:id/prekeys` endpoint.
+- New `state::prekey_secrets_path(identity_id)` returns the local path of the secrets file.
 
 ## [v0.2.0-alpha] - 2026-05-03
 

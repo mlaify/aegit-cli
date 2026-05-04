@@ -79,6 +79,16 @@ pub fn pq_key_material_path(identity_id: &str) -> PathBuf {
     identities_dir().join(format!("{}.pq-key.json", sanitize_segment(identity_id)))
 }
 
+/// Path of the locally-persisted private halves for the identity's
+/// currently-outstanding one-time prekey bundle. Each entry corresponds
+/// to a `key_id` that was POSTed to the relay's prekey publish endpoint.
+pub fn prekey_secrets_path(identity_id: &str) -> PathBuf {
+    identities_dir().join(format!(
+        "{}.prekey-secrets.json",
+        sanitize_segment(identity_id)
+    ))
+}
+
 pub fn ensure_parent_dir(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

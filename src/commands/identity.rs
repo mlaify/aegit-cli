@@ -2,9 +2,10 @@ use std::fs;
 
 use aegis_crypto::HybridPqKeyBundle;
 use aegis_identity::{
-    decode_local_dev_signing_key, generate_local_dev_signing_key_material, parse_identity_id,
-    HybridPqPrivateKeyMaterial, LocalDevSigningKeyMaterial, ALG_ED25519, ALG_MLDSA65, ALG_MLKEM768,
-    ALG_X25519, SUITE_HYBRID_PQ,
+    decode_local_dev_signing_key, generate_local_dev_signing_key_material, generate_prekey_bundle,
+    parse_identity_id, sign_prekey_bundle, HybridPqPrivateKeyMaterial, LocalDevSigningKeyMaterial,
+    PrekeyBundlePrivateMaterial, ALG_ED25519, ALG_MLDSA65, ALG_MLKEM768, ALG_X25519,
+    SUITE_HYBRID_PQ,
 };
 use aegis_proto::{IdentityDocument, IdentityId, PublicKeyRecord};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -19,6 +20,20 @@ pub enum IdentityCommand {
     Show(ShowArgs),
     List,
     Publish(PublishArgs),
+    PublishPrekeys(PublishPrekeysArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PublishPrekeysArgs {
+    /// Relay base URL to POST the bundle to.
+    #[arg(long, env = "AEGIS_RELAY_URL")]
+    pub relay: String,
+    /// Identity to publish prekeys for; defaults to the current default identity.
+    #[arg(long)]
+    pub identity: Option<String>,
+    /// Number of one-time prekeys to generate in this batch.
+    #[arg(long, default_value_t = 10)]
+    pub count: usize,
 }
 
 #[derive(Debug, Args)]
@@ -48,6 +63,7 @@ pub struct ShowArgs {
 pub fn run(cmd: IdentityCommand) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         IdentityCommand::Publish(args) => publish(args)?,
+        IdentityCommand::PublishPrekeys(args) => publish_prekeys(args)?,
         IdentityCommand::Init(args) => {
             let id = IdentityId(format!("amp:did:key:local-{}", Uuid::new_v4().simple()));
             let alias_list = args.alias.into_iter().collect::<Vec<_>>();
@@ -248,6 +264,72 @@ fn publish(args: PublishArgs) -> Result<(), Box<dyn std::error::Error>> {
     println!("published {}", doc.identity_id.0);
     println!("relay     {}", args.relay);
     println!("signed    {}", doc_path.display());
+    Ok(())
+}
+
+fn publish_prekeys(args: PublishPrekeysArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if args.count == 0 {
+        return Err("--count must be at least 1".into());
+    }
+
+    let identity_id = match args.identity {
+        Some(id) => id,
+        None => read_default_identity_id()?
+            .ok_or_else(|| "no default identity configured; run `aegit id init`".to_string())?,
+    };
+
+    let parsed = parse_identity_id(&identity_id)
+        .map_err(|_| format!("invalid identity id: {}", identity_id))?;
+
+    // Generate fresh batch of one-time prekeys.
+    let (mut bundle, private) = generate_prekey_bundle(&parsed, args.count, "ot");
+
+    // Sign with the identity's existing hybrid signing keys.
+    let pq_material = read_pq_key_material(&identity_id)?;
+    let ed25519_seed: [u8; 32] = STANDARD
+        .decode(&pq_material.ed25519_signing_seed_b64)?
+        .try_into()
+        .map_err(|_| "invalid ed25519 seed length")?;
+    let dilithium3_sk = STANDARD.decode(&pq_material.dilithium3_secret_key_b64)?;
+    sign_prekey_bundle(&mut bundle, &ed25519_seed, &dilithium3_sk)?;
+
+    // Persist private halves locally BEFORE publishing — if the network fails,
+    // we don't want to lose the secrets that match keys already on the relay.
+    // Merge with any existing prekey-secrets file so re-running this command
+    // appends to the local pool rather than overwriting it.
+    let secrets_path = state::prekey_secrets_path(&identity_id);
+    state::ensure_parent_dir(&secrets_path)?;
+    let mut combined: PrekeyBundlePrivateMaterial = if secrets_path.exists() {
+        let raw = fs::read_to_string(&secrets_path)?;
+        serde_json::from_str(&raw)?
+    } else {
+        PrekeyBundlePrivateMaterial {
+            identity_id: identity_id.clone(),
+            one_time_prekey_secrets: vec![],
+        }
+    };
+    combined
+        .one_time_prekey_secrets
+        .extend(private.one_time_prekey_secrets);
+    fs::write(&secrets_path, serde_json::to_string_pretty(&combined)?)?;
+
+    // POST to the relay.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(aegis_identity::resolver::publish_prekey_bundle(
+        &args.relay,
+        &bundle,
+    ))?;
+
+    println!("published_prekeys {}", bundle.identity_id.0);
+    println!("relay             {}", args.relay);
+    println!("count             {}", bundle.one_time_prekeys.len());
+    println!("secrets           {}", secrets_path.display());
+    println!(
+        "secrets_total     {}",
+        combined.one_time_prekey_secrets.len()
+    );
     Ok(())
 }
 
