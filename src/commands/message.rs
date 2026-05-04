@@ -6,8 +6,8 @@ use std::{
 
 use aegis_crypto::{DemoSuite, EnvelopeSigner, EnvelopeVerifier, HybridPqSuite, PayloadCipher};
 use aegis_identity::{
-    decode_local_dev_signing_key, parse_identity_id, ALG_ED25519, ALG_MLDSA65, ALG_MLKEM768,
-    ALG_X25519, SUITE_HYBRID_PQ,
+    decode_local_dev_signing_key, parse_identity_id, PrekeyBundlePrivateMaterial, ALG_ED25519,
+    ALG_MLDSA65, ALG_MLKEM768, ALG_X25519, SUITE_HYBRID_PQ,
 };
 use aegis_proto::{Envelope, IdentityId, MessageBody, PrivateHeaders, PrivatePayload, SuiteId};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -38,8 +38,17 @@ pub struct SealArgs {
     #[arg(long)]
     pub out: Option<PathBuf>,
     /// Relay URL for resolving recipient identity when not found locally.
+    /// Also used to claim a one-time prekey from the recipient's published
+    /// pool (v0.3 phase 3); pass `--no-prekey` to skip and use the recipient's
+    /// long-term Kyber768 from their IdentityDocument instead.
     #[arg(long, env = "AEGIS_RELAY_URL")]
     pub relay: Option<String>,
+    /// Skip the prekey claim and seal against the recipient's long-term
+    /// Kyber768 key. Useful for offline use, diagnostics, or when the
+    /// recipient's prekey pool is exhausted and you want a deterministic
+    /// fall-back.
+    #[arg(long, default_value_t = false)]
+    pub no_prekey: bool,
 }
 
 #[derive(Debug, Args)]
@@ -130,18 +139,69 @@ fn seal(args: SealArgs) -> Result<(), Box<dyn std::error::Error>> {
             .find(|k| k.algorithm == ALG_X25519)
             .map(|k| k.public_key_b64.as_str())
             .ok_or("recipient identity missing X25519 encryption key")?;
-        let kyber_pk_b64 = doc
-            .encryption_keys
-            .iter()
-            .find(|k| k.algorithm == ALG_MLKEM768)
-            .map(|k| k.public_key_b64.as_str())
-            .ok_or("recipient identity missing ML-KEM-768 encryption key")?;
-
         let recipient_x25519_pk: [u8; 32] = STANDARD
             .decode(x25519_pk_b64)?
             .try_into()
             .map_err(|_| "invalid X25519 public key length")?;
-        let recipient_kyber_pk = STANDARD.decode(kyber_pk_b64)?;
+
+        // (v0.3 phase 3) Try to claim a one-time prekey for the recipient
+        // when a relay is configured and --no-prekey wasn't passed. On
+        // success we use the prekey's Kyber public key for the KEM combine
+        // and stamp `envelope.used_prekey_ids` with the claimed key_id so
+        // the relay's atomic enforcement (phase 1) gates against replay.
+        // On `PrekeyPoolExhausted` we fall back to the recipient's
+        // long-term Kyber from the IdentityDocument and warn the user that
+        // forward secrecy is degraded for this message.
+        let (recipient_kyber_pk, claimed_prekey_key_id) = match (&args.relay, args.no_prekey) {
+            (Some(relay_url), false) => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                match rt.block_on(aegis_identity::resolver::claim_one_time_prekey(
+                    relay_url,
+                    &recipient_id.0,
+                )) {
+                    Ok(claimed) => {
+                        if claimed.algorithm != ALG_MLKEM768 {
+                            return Err(format!(
+                                "claimed prekey has unexpected algorithm {} (expected {})",
+                                claimed.algorithm, ALG_MLKEM768
+                            )
+                            .into());
+                        }
+                        let pk = STANDARD.decode(&claimed.public_key_b64)?;
+                        println!("prekey_claimed {}", claimed.key_id);
+                        (pk, Some(claimed.key_id))
+                    }
+                    Err(aegis_identity::resolver::ResolverError::PrekeyPoolExhausted(_)) => {
+                        eprintln!(
+                            "warning: prekey pool empty for {}; falling back to long-term \
+                             Kyber768 (forward secrecy degraded for this message)",
+                            recipient_id.0
+                        );
+                        let kyber_pk_b64 = doc
+                            .encryption_keys
+                            .iter()
+                            .find(|k| k.algorithm == ALG_MLKEM768)
+                            .map(|k| k.public_key_b64.as_str())
+                            .ok_or("recipient identity missing ML-KEM-768 encryption key")?;
+                        (STANDARD.decode(kyber_pk_b64)?, None)
+                    }
+                    Err(e) => {
+                        return Err(format!("could not claim prekey from relay: {}", e).into());
+                    }
+                }
+            }
+            _ => {
+                let kyber_pk_b64 = doc
+                    .encryption_keys
+                    .iter()
+                    .find(|k| k.algorithm == ALG_MLKEM768)
+                    .map(|k| k.public_key_b64.as_str())
+                    .ok_or("recipient identity missing ML-KEM-768 encryption key")?;
+                (STANDARD.decode(kyber_pk_b64)?, None)
+            }
+        };
 
         let sender_id = sender_hint.as_ref().ok_or(
             "sender identity required for hybrid PQ seal; run `aegit id init` or pass --from",
@@ -168,6 +228,10 @@ fn seal(args: SealArgs) -> Result<(), Box<dyn std::error::Error>> {
             suite.suite_id(),
             encrypted,
         );
+        // Stamp the claimed prekey BEFORE signing so the signature covers it.
+        if let Some(ref key_id) = claimed_prekey_key_id {
+            envelope.used_prekey_ids = vec![key_id.clone()];
+        }
         let classical_sig = suite.sign_envelope(&envelope)?;
         let pq_sig = suite.sign_envelope_pq(&envelope)?;
         envelope.outer_signature_b64 = Some(classical_sig);
@@ -316,7 +380,17 @@ fn open_hybrid_pq(envelope: &Envelope) -> Result<PrivatePayload, Box<dyn std::er
         .decode(&pq_material.x25519_private_key_b64)?
         .try_into()
         .map_err(|_| "invalid X25519 private key length")?;
-    let kyber768_sk = STANDARD.decode(&pq_material.kyber768_secret_key_b64)?;
+
+    // (v0.3 phase 3) If the sender claimed a one-time prekey, decapsulate
+    // with that prekey's Kyber secret instead of our long-term Kyber.
+    // Phase 3 supports exactly one prekey per envelope; later phases may
+    // generalize to multi-key contexts. After successful decrypt we splice
+    // the consumed secret out of the local pool so it cannot be reused.
+    let prekey_key_id = envelope.used_prekey_ids.first().cloned();
+    let kyber768_sk = match prekey_key_id.as_deref() {
+        Some(key_id) => load_one_time_prekey_secret(recipient_id, key_id)?,
+        None => STANDARD.decode(&pq_material.kyber768_secret_key_b64)?,
+    };
 
     let (sender_ed_vk, sender_dil_pk) = if let Some(sender) = envelope.sender_hint.as_ref() {
         match identity::read_identity_document(&sender.0) {
@@ -360,7 +434,96 @@ fn open_hybrid_pq(envelope: &Envelope) -> Result<PrivatePayload, Box<dyn std::er
         println!("pq_signature absent");
     }
 
-    Ok(suite.decrypt_payload(&envelope.payload)?)
+    let payload = suite.decrypt_payload(&envelope.payload)?;
+
+    // Forward secrecy: only after a successful AEAD-verified decrypt do we
+    // discard the consumed prekey secret. If the persistence step itself
+    // fails we still return the plaintext (the user has it in memory and
+    // the relay's atomic enforcement prevents replay) but we surface the
+    // warning so the operator can investigate.
+    if let Some(key_id) = prekey_key_id {
+        if let Err(err) = consume_one_time_prekey_secret(recipient_id, &key_id) {
+            eprintln!(
+                "warning: failed to remove consumed prekey secret {} for {}: {}",
+                key_id, recipient_id, err
+            );
+        } else {
+            println!("prekey_consumed {}", key_id);
+        }
+    }
+
+    Ok(payload)
+}
+
+/// Load the Kyber768 secret bytes for a one-time prekey `key_id` from the
+/// recipient's locally-stored prekey-secrets file. Returns a clear error
+/// when the file is missing or the `key_id` was already consumed (or never
+/// generated).
+fn load_one_time_prekey_secret(
+    identity_id: &str,
+    key_id: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let secrets = read_prekey_secrets(identity_id).ok_or_else(|| {
+        format!(
+            "envelope references prekey {} but no prekey-secrets file exists for {}",
+            key_id, identity_id
+        )
+    })?;
+    let entry = secrets
+        .one_time_prekey_secrets
+        .iter()
+        .find(|s| s.key_id == key_id)
+        .ok_or_else(|| {
+            format!(
+                "no local prekey secret matches key_id {} for {} \
+                 (already consumed, or sender used a stale claim)",
+                key_id, identity_id
+            )
+        })?;
+    Ok(STANDARD.decode(&entry.kyber768_secret_key_b64)?)
+}
+
+/// Splice the consumed prekey secret out of the local pool and rewrite the
+/// file atomically (tmpfile + rename). If no entry matches the call is a
+/// no-op (already consumed); in that case we still return Ok.
+fn consume_one_time_prekey_secret(
+    identity_id: &str,
+    key_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut secrets = match read_prekey_secrets(identity_id) {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+    let before = secrets.one_time_prekey_secrets.len();
+    secrets
+        .one_time_prekey_secrets
+        .retain(|s| s.key_id != key_id);
+    if secrets.one_time_prekey_secrets.len() == before {
+        return Ok(());
+    }
+    write_prekey_secrets_atomic(identity_id, &secrets)
+}
+
+fn read_prekey_secrets(identity_id: &str) -> Option<PrekeyBundlePrivateMaterial> {
+    let path = state::prekey_secrets_path(identity_id);
+    if !path.exists() {
+        return None;
+    }
+    let raw = fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn write_prekey_secrets_atomic(
+    identity_id: &str,
+    secrets: &PrekeyBundlePrivateMaterial,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = state::prekey_secrets_path(identity_id);
+    state::ensure_parent_dir(&path)?;
+    let tmp_path = path.with_extension("json.tmp");
+    let body = serde_json::to_string_pretty(secrets)?;
+    fs::write(&tmp_path, body)?;
+    fs::rename(&tmp_path, &path)?;
+    Ok(())
 }
 
 fn list(args: ListArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -546,5 +709,144 @@ mod tests {
         envelope.outer_signature_b64 = Some("c2ln".to_string());
         let status = demo_signature_status(&envelope);
         assert_eq!(status.label(), "verification_unavailable");
+    }
+
+    // ----- Phase 3: prekey-secrets persistence helpers -----
+
+    use aegis_identity::OneTimePrekeySecret;
+    use std::sync::Mutex;
+
+    /// Serializes `AEGIT_STATE_DIR` env-var manipulation. Cargo runs tests in
+    /// parallel; without this lock concurrent tests would step on each other's
+    /// state-dir setting and race to read/write the same files.
+    static STATE_DIR_LOCK: Mutex<()> = Mutex::new(());
+
+    /// RAII guard that holds the env-var lock until dropped, so the `#[test]`
+    /// body's reads of `state::prekey_secrets_path()` always see the value we
+    /// just set rather than another concurrent test's value.
+    struct StateDirGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _path: PathBuf,
+    }
+
+    fn isolated_state_dir(tag: &str) -> StateDirGuard {
+        let lock = STATE_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = std::env::temp_dir().join(format!(
+            "aegit-prekey-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            uuid_simple()
+        ));
+        std::env::set_var("AEGIT_STATE_DIR", &path);
+        StateDirGuard {
+            _lock: lock,
+            _path: path,
+        }
+    }
+
+    fn uuid_simple() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("{:016x}{:016x}", now, n)
+    }
+
+    fn seed_secrets(identity_id: &str, key_ids: &[&str]) {
+        let secrets = PrekeyBundlePrivateMaterial {
+            identity_id: identity_id.to_string(),
+            one_time_prekey_secrets: key_ids
+                .iter()
+                .map(|k| OneTimePrekeySecret {
+                    key_id: k.to_string(),
+                    algorithm: ALG_MLKEM768.to_string(),
+                    // Real Kyber768 secret bytes are ~2400 bytes; for these
+                    // helpers we only need a valid-base64 placeholder since
+                    // we never actually decapsulate.
+                    kyber768_secret_key_b64: STANDARD.encode(vec![0u8; 4]),
+                })
+                .collect(),
+        };
+        write_prekey_secrets_atomic(identity_id, &secrets).expect("seed write");
+    }
+
+    #[test]
+    fn load_one_time_prekey_secret_returns_bytes_when_key_id_matches() {
+        let _dir = isolated_state_dir("load-match");
+        let id = "amp:did:key:z6MkLoadMatch";
+        seed_secrets(id, &["ot-1", "ot-2"]);
+
+        let bytes = load_one_time_prekey_secret(id, "ot-2").expect("load");
+        assert_eq!(bytes, vec![0u8; 4]);
+    }
+
+    #[test]
+    fn load_one_time_prekey_secret_errors_when_key_id_missing() {
+        let _dir = isolated_state_dir("load-miss");
+        let id = "amp:did:key:z6MkLoadMiss";
+        seed_secrets(id, &["ot-1"]);
+
+        let err = load_one_time_prekey_secret(id, "ot-not-here").expect_err("must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ot-not-here") && msg.contains("already consumed"),
+            "error must explain mismatch: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn load_one_time_prekey_secret_errors_when_secrets_file_absent() {
+        let _dir = isolated_state_dir("load-no-file");
+        let id = "amp:did:key:z6MkLoadNoFile";
+
+        let err = load_one_time_prekey_secret(id, "ot-1").expect_err("must error");
+        assert!(
+            err.to_string().contains("no prekey-secrets file"),
+            "error must explain missing file: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn consume_one_time_prekey_secret_removes_only_matching_entry() {
+        let _dir = isolated_state_dir("consume");
+        let id = "amp:did:key:z6MkConsume";
+        seed_secrets(id, &["ot-a", "ot-b", "ot-c"]);
+
+        consume_one_time_prekey_secret(id, "ot-b").expect("consume");
+
+        let after = read_prekey_secrets(id).expect("read after consume");
+        let remaining: Vec<&str> = after
+            .one_time_prekey_secrets
+            .iter()
+            .map(|s| s.key_id.as_str())
+            .collect();
+        assert_eq!(remaining, vec!["ot-a", "ot-c"]);
+    }
+
+    #[test]
+    fn consume_one_time_prekey_secret_is_idempotent_on_missing_key() {
+        let _dir = isolated_state_dir("consume-idempotent");
+        let id = "amp:did:key:z6MkConsumeIdem";
+        seed_secrets(id, &["ot-a"]);
+
+        // First consume removes ot-a; second consume of the same key is a no-op.
+        consume_one_time_prekey_secret(id, "ot-a").expect("first consume");
+        consume_one_time_prekey_secret(id, "ot-a").expect("second consume should be ok");
+
+        let after = read_prekey_secrets(id).expect("read after consume");
+        assert!(after.one_time_prekey_secrets.is_empty());
+    }
+
+    #[test]
+    fn consume_one_time_prekey_secret_no_op_when_file_absent() {
+        let _dir = isolated_state_dir("consume-no-file");
+        let id = "amp:did:key:z6MkConsumeNoFile";
+        consume_one_time_prekey_secret(id, "ot-anything")
+            .expect("consume should be ok when file absent");
     }
 }
