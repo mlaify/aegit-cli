@@ -4,6 +4,15 @@ All notable changes to this repository are documented here.
 
 ## [Unreleased]
 
+### v0.3.0-alpha — phase 3 (send-side integration; end-to-end forward secrecy)
+
+- `aegit msg seal`: when `--relay <url>` is configured and the recipient's identity advertises the hybrid PQ suite, calls `aegis_identity::resolver::claim_one_time_prekey()` to atomically pull one one-time prekey from the recipient's published pool. The claimed Kyber768 public key replaces the recipient's long-term Kyber768 in the hybrid combine; `envelope.used_prekey_ids` is stamped with the claimed `key_id` before signing so the outer signatures cover it.
+- `aegit msg seal`: graceful fallback on `PrekeyPoolExhausted` — falls back to long-term Kyber768 from the IdentityDocument with a stderr warning that forward secrecy is degraded for that message. Other claim errors are surfaced (the user's relay is unreachable; push will fail too).
+- `aegit msg seal`: new `--no-prekey` escape hatch to force long-term Kyber768. Useful for offline use, diagnostics, and deterministic fallback testing.
+- `aegit msg open`: when `envelope.used_prekey_ids` is non-empty, looks up the matching `OneTimePrekeySecret` in the local `<id>.prekey-secrets.json` (via the `state::prekey_secrets_path()` shipped in phase 2) and substitutes the prekey's Kyber768 secret in `HybridPqSuite::for_recipient`. Clear error messages distinguish "no prekey-secrets file" from "key_id not in pool (already consumed or stale claim)".
+- `aegit msg open`: **forward-secrecy delete** — only after a successful AEAD-verified `decrypt_payload`, the consumed `OneTimePrekeySecret` is spliced out of the local `PrekeyBundlePrivateMaterial` and the file is rewritten via tmp-file + rename. Persistence failure surfaces as a stderr warning but does not poison the returned plaintext.
+- 6 new unit tests covering the load + consume contract: matching key returns bytes; missing key gives clear error; missing file gives clear error; consume removes only the matching entry; consume is idempotent on already-removed key; consume is a no-op when the file is absent.
+
 ### v0.3.0-alpha — phase 2 (prekey publish + atomic claim)
 
 - New `aegit id publish-prekeys --relay <url> [--count N=10] [--identity <id>]` command:
