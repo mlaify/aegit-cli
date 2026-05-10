@@ -10,7 +10,7 @@ use aegis_api_types::{
 use aegis_proto::Envelope;
 use clap::{Args, Subcommand};
 
-use crate::state;
+use crate::{config, state};
 
 #[derive(Debug, Subcommand)]
 pub enum RelayCommand {
@@ -23,10 +23,14 @@ pub enum RelayCommand {
 
 #[derive(Debug, Args)]
 pub struct PushArgs {
+    /// Relay base URL (e.g. `https://relay.example.com`). Falls back to
+    /// `AEGIS_RELAY_URL` env, then `relay = ...` in the config file.
     #[arg(long)]
-    pub relay: String,
+    pub relay: Option<String>,
     #[arg(long)]
     pub input: String,
+    /// Bearer token for authenticated relays. Falls back to
+    /// `AEGIS_RELAY_TOKEN` env, then `token = ...` in the config file.
     #[arg(long)]
     pub token: Option<String>,
 }
@@ -34,17 +38,19 @@ pub struct PushArgs {
 #[derive(Debug, Args)]
 pub struct FetchArgs {
     #[arg(long)]
-    pub relay: String,
+    pub relay: Option<String>,
     #[arg(long)]
     pub recipient: String,
     #[arg(long)]
     pub out: Option<PathBuf>,
+    #[arg(long)]
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Args)]
 pub struct AckArgs {
     #[arg(long)]
-    pub relay: String,
+    pub relay: Option<String>,
     #[arg(long)]
     pub recipient: String,
     #[arg(long)]
@@ -56,7 +62,7 @@ pub struct AckArgs {
 #[derive(Debug, Args)]
 pub struct DeleteArgs {
     #[arg(long)]
-    pub relay: String,
+    pub relay: Option<String>,
     #[arg(long)]
     pub recipient: String,
     #[arg(long)]
@@ -68,7 +74,7 @@ pub struct DeleteArgs {
 #[derive(Debug, Args)]
 pub struct CleanupArgs {
     #[arg(long)]
-    pub relay: String,
+    pub relay: Option<String>,
     #[arg(long)]
     pub token: Option<String>,
 }
@@ -76,14 +82,16 @@ pub struct CleanupArgs {
 pub fn run(cmd: RelayCommand) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         RelayCommand::Push(args) => {
+            let relay_url = config::resolve_relay_required(args.relay.as_deref())?;
+            let token = config::resolve_token(args.token.as_deref());
             let raw = fs::read_to_string(&args.input)?;
             let envelope = Envelope::from_json(&raw)?;
             let envelope_id = envelope.envelope_id.0.to_string();
             let recipient_id = envelope.recipient_id.0.clone();
             let client = reqwest::blocking::Client::new();
-            let url = format!("{}/v1/envelopes", args.relay.trim_end_matches('/'));
+            let url = format!("{}/v1/envelopes", relay_url.trim_end_matches('/'));
             let req = client.post(url).json(&StoreEnvelopeRequest { envelope });
-            let req = with_token(req, args.token.as_deref());
+            let req = with_token(req, token.as_deref());
             let resp: StoreEnvelopeResponse = req.send()?.error_for_status()?.json()?;
             println!("pushed {}", args.input);
             println!("id {}", envelope_id);
@@ -92,13 +100,16 @@ pub fn run(cmd: RelayCommand) -> Result<(), Box<dyn std::error::Error>> {
             println!("accepted {}", resp.accepted);
         }
         RelayCommand::Fetch(args) => {
+            let relay_url = config::resolve_relay_required(args.relay.as_deref())?;
+            let token = config::resolve_token(args.token.as_deref());
             let client = reqwest::blocking::Client::new();
             let url = format!(
                 "{}/v1/envelopes/{}",
-                args.relay.trim_end_matches('/'),
+                relay_url.trim_end_matches('/'),
                 args.recipient
             );
-            let resp = client.get(url).send()?.error_for_status()?;
+            let req = with_token(client.get(url), token.as_deref());
+            let resp = req.send()?.error_for_status()?;
             let data: FetchEnvelopeResponse = resp.json()?;
             let out = args
                 .out
@@ -112,37 +123,43 @@ pub fn run(cmd: RelayCommand) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         RelayCommand::Ack(args) => {
+            let relay_url = config::resolve_relay_required(args.relay.as_deref())?;
+            let token = config::resolve_token(args.token.as_deref());
             let client = reqwest::blocking::Client::new();
             let url = format!(
                 "{}/v1/envelopes/{}/{}/ack",
-                args.relay.trim_end_matches('/'),
+                relay_url.trim_end_matches('/'),
                 args.recipient,
                 args.envelope_id
             );
-            let req = with_token(client.post(url), args.token.as_deref());
+            let req = with_token(client.post(url), token.as_deref());
             let resp: EnvelopeLifecycleResponse = req.send()?.error_for_status()?.json()?;
             println!("status {}", resp.status);
             println!("recipient {}", resp.recipient_id);
             println!("id {}", resp.envelope_id);
         }
         RelayCommand::Delete(args) => {
+            let relay_url = config::resolve_relay_required(args.relay.as_deref())?;
+            let token = config::resolve_token(args.token.as_deref());
             let client = reqwest::blocking::Client::new();
             let url = format!(
                 "{}/v1/envelopes/{}/{}",
-                args.relay.trim_end_matches('/'),
+                relay_url.trim_end_matches('/'),
                 args.recipient,
                 args.envelope_id
             );
-            let req = with_token(client.delete(url), args.token.as_deref());
+            let req = with_token(client.delete(url), token.as_deref());
             let resp: EnvelopeLifecycleResponse = req.send()?.error_for_status()?.json()?;
             println!("status {}", resp.status);
             println!("recipient {}", resp.recipient_id);
             println!("id {}", resp.envelope_id);
         }
         RelayCommand::Cleanup(args) => {
+            let relay_url = config::resolve_relay_required(args.relay.as_deref())?;
+            let token = config::resolve_token(args.token.as_deref());
             let client = reqwest::blocking::Client::new();
-            let url = format!("{}/v1/cleanup", args.relay.trim_end_matches('/'));
-            let req = with_token(client.post(url), args.token.as_deref());
+            let url = format!("{}/v1/cleanup", relay_url.trim_end_matches('/'));
+            let req = with_token(client.post(url), token.as_deref());
             let resp: RelayCleanupResponse = req.send()?.error_for_status()?.json()?;
             println!("expired_removed {}", resp.expired_removed);
             println!("orphan_ack_removed {}", resp.orphan_ack_removed);

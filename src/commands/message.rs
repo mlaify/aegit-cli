@@ -124,7 +124,14 @@ fn read_identity_document_opt(identity_id: &str) -> Option<aegis_proto::Identity
     identity::read_identity_document(identity_id).ok()
 }
 
-fn seal(args: SealArgs) -> Result<(), Box<dyn std::error::Error>> {
+fn seal(mut args: SealArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // Fold in the config-file fallback for --relay. The clap `env`
+    // attribute already covers AEGIS_RELAY_URL; this picks up the
+    // config-file `relay = ...` key when neither flag nor env is set.
+    if args.relay.as_deref().filter(|s| !s.is_empty()).is_none() {
+        args.relay = crate::config::resolve_relay(None);
+    }
+
     let (recipient_id, resolved_recipient_doc) =
         resolve_recipient_target(&args.to, args.relay.as_deref())?;
 
