@@ -4,6 +4,15 @@ All notable changes to this repository are documented here.
 
 ## [Unreleased]
 
+### Configurable signature verification policy on `aegit msg open` (closes #4)
+
+- New `--signature-policy <mode>` flag on `aegit msg open`. Modes: `none`, `best-effort` (default — mirrors v0.2 behavior), `require-classical`, `require-pq`, `require-both`. Wires through to the new `SignaturePolicy` types from `aegis-crypto` (closes aegis-core#6).
+- New stdout line printed after the existing per-slot lines: `signature_policy accept (best-effort)` or `signature_policy reject (require-pq): <reason>`. Existing `classical_signature verified/FAILED/absent`, `pq_signature ...`, and demo-suite `signature_status ...` lines are preserved verbatim so anything parsing aegit's output still works.
+- On `Reject`, the CLI returns a non-zero exit and **does not decrypt or write the payload** — strict modes are real gates, not warnings. On `Accept`, the existing decrypt/write/print flow is unchanged.
+- Demo-suite path: legacy `SignatureStatus` (`Unsigned` / `Verified` / `Failed` / `Unavailable`) is mapped to the unified `SignatureCheck` so all five policy modes work for demo envelopes too. `Unavailable` → `Failed` (a present-but-unverified signature must not pass policy checks).
+- Hybrid-PQ path: per-slot results are built directly from the existing `verify_envelope` / `verify_envelope_pq` calls.
+- 14 new unit tests cover the CLI flag wiring: enum mapping, default-is-best-effort, kebab-case label round-trip, `SignatureStatus` → `SignatureCheck` adapter, and `enforce_policy` Accept/Reject behavior across each mode.
+
 ### v0.3.0-alpha — phase 3 (send-side integration; end-to-end forward secrecy)
 
 - `aegit msg seal`: when `--relay <url>` is configured and the recipient's identity advertises the hybrid PQ suite, calls `aegis_identity::resolver::claim_one_time_prekey()` to atomically pull one one-time prekey from the recipient's published pool. The claimed Kyber768 public key replaces the recipient's long-term Kyber768 in the hybrid combine; `envelope.used_prekey_ids` is stamped with the claimed `key_id` before signing so the outer signatures cover it.
