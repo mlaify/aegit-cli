@@ -4,6 +4,18 @@ All notable changes to this repository are documented here.
 
 ## [Unreleased]
 
+### CLI config file support (closes #7)
+
+- New `~/.aegis/aegit/config.toml` config file with per-user defaults for `relay`, `token`, and `state_dir`. All keys optional. Override file location with `AEGIT_CONFIG=/path/to/config.toml`.
+- Resolution order for each setting: explicit CLI flag → env var (`AEGIS_RELAY_URL` / `AEGIS_RELAY_TOKEN` / `AEGIT_STATE_DIR`) → config file → built-in default.
+- All five relay subcommands (`push`, `fetch`, `ack`, `delete`, `cleanup`) now have `--relay` and `--token` as **optional** flags backed by the config-file fallback. `--relay` was previously required on every invocation; existing scripts continue to work since explicit flags still win. `aegit relay fetch` gains `--token` (was previously omitted by accident).
+- `aegit msg seal --relay` now also falls back to the config file when neither flag nor `AEGIS_RELAY_URL` env is set.
+- `aegit relay ...` without any relay source emits a clear error pointing at the three resolution paths: `no relay URL configured. Pass --relay <url>, set AEGIS_RELAY_URL, or add 'relay = "..."' to ~/.aegis/aegit/config.toml`.
+- Malformed config files are a hard error (silent typos can't masquerade as "no config"). Unknown keys are tolerated for forward compatibility.
+- New deps: `serde` (with `derive`), `toml`, `thiserror`. New module `src/config.rs`.
+- 13 new unit tests cover load semantics (missing / valid / partial / empty / malformed / unknown-keys), the resolution-order matrix (flag > env > config > none), empty-string-arg-as-unset edge case, and `config_path` resolution from `AEGIT_CONFIG` and `HOME`.
+- README documents the schema, file location, override env, and resolution order.
+
 ### Configurable signature verification policy on `aegit msg open` (closes #4)
 
 - New `--signature-policy <mode>` flag on `aegit msg open`. Modes: `none`, `best-effort` (default — mirrors v0.2 behavior), `require-classical`, `require-pq`, `require-both`. Wires through to the new `SignaturePolicy` types from `aegis-crypto` (closes aegis-core#6).

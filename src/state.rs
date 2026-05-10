@@ -3,13 +3,26 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::config;
+
 pub fn state_root() -> PathBuf {
+    // Precedence: AEGIT_STATE_DIR env > config file `state_dir` >
+    // $HOME/.aegis/aegit > "./.aegit" (bare-fallback for envs with
+    // neither HOME nor a config).
     if let Ok(path) = env::var("AEGIT_STATE_DIR") {
-        return PathBuf::from(path);
+        if !path.is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+
+    if let Some(path) = config::resolve_state_dir_from_config() {
+        return path;
     }
 
     if let Ok(home) = env::var("HOME") {
-        return PathBuf::from(home).join(".aegis").join("aegit");
+        if !home.is_empty() {
+            return PathBuf::from(home).join(".aegis").join("aegit");
+        }
     }
 
     PathBuf::from(".aegit")

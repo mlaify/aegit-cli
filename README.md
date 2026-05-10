@@ -22,6 +22,30 @@ A git-flavored operator CLI for Aegis.
 - `aegit relay delete`
 - `aegit relay cleanup`
 
+## Configuration
+
+Per-user defaults live in a TOML file at `~/.aegis/aegit/config.toml`. All
+keys are optional; CLI flags and env vars always win.
+
+```toml
+relay = "https://relay.example.com"   # default for --relay
+token = "dev-relay-token"              # default for --token
+state_dir = "/var/lib/aegit"           # alternative to AEGIT_STATE_DIR
+```
+
+Resolution order for each setting:
+
+1. Explicit CLI flag (`--relay`, `--token`, `--out`, ...)
+2. Environment variable (`AEGIS_RELAY_URL`, `AEGIS_RELAY_TOKEN`,
+   `AEGIT_STATE_DIR`)
+3. Config file (above)
+4. Built-in default, where applicable
+
+Override the config file location with `AEGIT_CONFIG=/path/to/config.toml`.
+
+A missing config file is fine — defaults apply. A malformed config file is
+a hard error so silent typos can't masquerade as "no config".
+
 ## Local state
 
 Default state root:
@@ -30,7 +54,8 @@ Default state root:
 
 Override with:
 
-- `AEGIT_STATE_DIR=/path/to/state`
+- `AEGIT_STATE_DIR=/path/to/state` (env var)
+- `state_dir = "..."` in `~/.aegis/aegit/config.toml` (config file)
 
 Default locations:
 
