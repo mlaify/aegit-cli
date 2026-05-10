@@ -4,6 +4,23 @@ All notable changes to this repository are documented here.
 
 ## [Unreleased]
 
+### Lifecycle output polish + error hints on `aegit relay ...` (closes #6)
+
+- Every relay subcommand now leads its stdout with a `status <verb>` line — `pushed` / `fetched` / `acknowledged` / `deleted` / `cleaned` — so quick-glance output answers "did it work?" first. Subsequent key=value lines are unchanged in spirit; some reordering for consistency.
+- **Bug fix**: `aegit relay cleanup` was silently dropping `old_removed` from its output (the relay returns it; the CLI just never printed it). Now prints all three counters: `expired_removed`, `orphan_ack_removed`, `old_removed`.
+- New 4xx/5xx error hint mapping. On non-2xx responses, the CLI now emits to stderr:
+  - The relay's structured `relay_error_code` + `relay_error_message` lines when the body decodes as `RelayErrorResponse` (raw body otherwise)
+  - A `hint:` line with operator-targeted guidance, varied by HTTP status × operation. Examples:
+    - `401` → `relay requires authentication. Pass --token, set AEGIS_RELAY_TOKEN, or add 'token = "..."' to ~/.aegis/aegit/config.toml`
+    - `403` → `token lacks the required scope (push needs PushEnvelope; ack/delete/cleanup need LifecycleChange; identity puts need IdentityWrite)`
+    - `404` on `ack` → `envelope not found (it may already have been acknowledged or deleted, or the recipient ID is wrong)`
+    - `404` on `delete` → similar but distinguishes "may already have been deleted"
+    - `404` on `fetch` → `no envelopes for recipient (or recipient ID is unknown to this relay)`
+    - `409` on `push` → `envelope rejected by relay (commonly: prekey already used or unknown). Re-claim a fresh prekey with 'aegit msg seal --relay ...' and retry.`
+    - `413` on `push` → mentions size limit
+    - generic `5xx` → `try again later`
+- 8 new unit tests on `relay_error_hint` cover each case + the 2xx-returns-None safety property.
+
 ### CLI config file support (closes #7)
 
 - New `~/.aegis/aegit/config.toml` config file with per-user defaults for `relay`, `token`, and `state_dir`. All keys optional. Override file location with `AEGIT_CONFIG=/path/to/config.toml`.
