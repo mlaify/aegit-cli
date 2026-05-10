@@ -4,16 +4,53 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use aegis_crypto::{DemoSuite, EnvelopeSigner, EnvelopeVerifier, HybridPqSuite, PayloadCipher};
+use aegis_crypto::{
+    DemoSuite, EnvelopeSigner, EnvelopeVerifier, HybridPqSuite, PayloadCipher, PolicyAction,
+    SignatureCheck, SignaturePolicy, VerificationOutcome,
+};
 use aegis_identity::{
     decode_local_dev_signing_key, parse_identity_id, PrekeyBundlePrivateMaterial, ALG_ED25519,
     ALG_MLDSA65, ALG_MLKEM768, ALG_X25519, SUITE_HYBRID_PQ,
 };
 use aegis_proto::{Envelope, IdentityId, MessageBody, PrivateHeaders, PrivatePayload, SuiteId};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 
 use crate::{commands::identity, state};
+
+/// CLI mirror of `aegis_crypto::SignaturePolicy`. Defined here (instead of
+/// deriving `clap::ValueEnum` directly on the core enum) so `aegis-crypto`
+/// stays free of the `clap` dep.
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+pub enum SignaturePolicyArg {
+    /// Skip verification entirely. Always opens the message. Useful for
+    /// debugging and parse-only flows; **discouraged for real use**.
+    None,
+    /// Verify whatever signatures are present; an absent signature slot
+    /// is tolerated. Mirrors v0.2's historical behavior.
+    #[default]
+    BestEffort,
+    /// Classical (Ed25519) signature MUST verify. PQ tolerated when absent
+    /// but rejected when present-but-failed. For transitional deployments.
+    RequireClassical,
+    /// PQ (ML-DSA-65) signature MUST verify. Classical tolerated when
+    /// absent but rejected when present-but-failed. Recommended for v0.3+.
+    RequirePq,
+    /// Both signatures MUST be present and verify. Strictest mode.
+    RequireBoth,
+}
+
+impl From<SignaturePolicyArg> for SignaturePolicy {
+    fn from(v: SignaturePolicyArg) -> Self {
+        match v {
+            SignaturePolicyArg::None => SignaturePolicy::None,
+            SignaturePolicyArg::BestEffort => SignaturePolicy::BestEffort,
+            SignaturePolicyArg::RequireClassical => SignaturePolicy::RequireClassical,
+            SignaturePolicyArg::RequirePq => SignaturePolicy::RequirePq,
+            SignaturePolicyArg::RequireBoth => SignaturePolicy::RequireBoth,
+        }
+    }
+}
 
 #[derive(Debug, Subcommand)]
 pub enum MessageCommand {
@@ -60,6 +97,13 @@ pub struct OpenArgs {
     pub passphrase: Option<String>,
     #[arg(long)]
     pub out: Option<PathBuf>,
+    /// How to combine per-slot signature verification results into an
+    /// open/reject decision. Default is `best-effort`, which mirrors
+    /// the v0.2 behavior. Stricter modes (`require-classical`,
+    /// `require-pq`, `require-both`) refuse to decrypt the payload
+    /// when verification doesn't meet the bar.
+    #[arg(long, value_enum, default_value_t = SignaturePolicyArg::BestEffort)]
+    pub signature_policy: SignaturePolicyArg,
 }
 
 #[derive(Debug, Args)]
@@ -317,18 +361,29 @@ fn open(args: OpenArgs) -> Result<(), Box<dyn std::error::Error>> {
     let raw = fs::read_to_string(&args.input)?;
     let envelope = Envelope::from_json(&raw)?;
 
+    let policy: SignaturePolicy = args.signature_policy.into();
+
     let payload = match &envelope.suite_id {
-        SuiteId::HybridX25519MlKem768Ed25519MlDsa65 => open_hybrid_pq(&envelope)?,
+        SuiteId::HybridX25519MlKem768Ed25519MlDsa65 => open_hybrid_pq(&envelope, policy)?,
         _ => {
             let passphrase = args
                 .passphrase
                 .ok_or("--passphrase required for demo suite envelopes")?;
             let suite = DemoSuite::from_passphrase(&passphrase);
             let sig_status = demo_signature_status(&envelope);
+            // Preserved legacy output so anything parsing aegit's stdout still
+            // sees these lines.
             println!("signature_status {}", sig_status.label());
             if let Some(reason) = sig_status.reason() {
                 println!("signature_detail {}", reason);
             }
+            // Demo envelopes have no PQ signature slot; fold the existing
+            // SignatureStatus into the policy outcome with classical only.
+            let outcome = VerificationOutcome {
+                classical: signature_status_to_check(&sig_status),
+                pq: SignatureCheck::Absent,
+            };
+            enforce_policy(policy, &outcome)?;
             suite.decrypt_payload(&envelope.payload)?
         }
     };
@@ -366,7 +421,10 @@ fn open(args: OpenArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn open_hybrid_pq(envelope: &Envelope) -> Result<PrivatePayload, Box<dyn std::error::Error>> {
+fn open_hybrid_pq(
+    envelope: &Envelope,
+    policy: SignaturePolicy,
+) -> Result<PrivatePayload, Box<dyn std::error::Error>> {
     let recipient_id = &envelope.recipient_id.0;
 
     let pq_material = identity::read_pq_key_material(recipient_id).map_err(|_| {
@@ -416,23 +474,46 @@ fn open_hybrid_pq(envelope: &Envelope) -> Result<PrivatePayload, Box<dyn std::er
 
     let suite = HybridPqSuite::for_recipient(x25519_sk, kyber768_sk, sender_ed_vk, sender_dil_pk);
 
-    if let Some(sig) = envelope.outer_signature_b64.as_deref() {
-        match suite.verify_envelope(envelope, sig) {
-            Ok(()) => println!("classical_signature verified"),
-            Err(e) => println!("classical_signature FAILED: {}", e),
+    let classical = match envelope.outer_signature_b64.as_deref() {
+        Some(sig) => match suite.verify_envelope(envelope, sig) {
+            Ok(()) => {
+                println!("classical_signature verified");
+                SignatureCheck::Verified
+            }
+            Err(e) => {
+                println!("classical_signature FAILED: {}", e);
+                SignatureCheck::Failed {
+                    reason: e.to_string(),
+                }
+            }
+        },
+        None => {
+            println!("classical_signature absent");
+            SignatureCheck::Absent
         }
-    } else {
-        println!("classical_signature absent");
-    }
+    };
 
-    if let Some(pq_sig) = envelope.outer_pq_signature_b64.as_deref() {
-        match suite.verify_envelope_pq(envelope, pq_sig) {
-            Ok(()) => println!("pq_signature verified"),
-            Err(e) => println!("pq_signature FAILED: {}", e),
+    let pq = match envelope.outer_pq_signature_b64.as_deref() {
+        Some(pq_sig) => match suite.verify_envelope_pq(envelope, pq_sig) {
+            Ok(()) => {
+                println!("pq_signature verified");
+                SignatureCheck::Verified
+            }
+            Err(e) => {
+                println!("pq_signature FAILED: {}", e);
+                SignatureCheck::Failed {
+                    reason: e.to_string(),
+                }
+            }
+        },
+        None => {
+            println!("pq_signature absent");
+            SignatureCheck::Absent
         }
-    } else {
-        println!("pq_signature absent");
-    }
+    };
+
+    let outcome = VerificationOutcome { classical, pq };
+    enforce_policy(policy, &outcome)?;
 
     let payload = suite.decrypt_payload(&envelope.payload)?;
 
@@ -557,6 +638,61 @@ fn resolve_sender(from: Option<String>) -> Result<Option<IdentityId>, Box<dyn st
             }
             None => Ok(None),
         },
+    }
+}
+
+/// Map the legacy `SignatureStatus` (demo-suite path) into the unified
+/// [`SignatureCheck`] used by `SignaturePolicy::evaluate`. Both
+/// `Unsigned` and the demo path's "absent" semantics map to `Absent`;
+/// `Unavailable` (signature present but verifier could not run — e.g.
+/// missing sender_hint) is treated as `Failed` because we can't trust an
+/// unverified signature to be valid for policy purposes.
+fn signature_status_to_check(s: &SignatureStatus) -> SignatureCheck {
+    match s {
+        SignatureStatus::Unsigned => SignatureCheck::Absent,
+        SignatureStatus::Verified => SignatureCheck::Verified,
+        SignatureStatus::Failed(reason) => SignatureCheck::Failed {
+            reason: reason.clone(),
+        },
+        SignatureStatus::Unavailable(reason) => SignatureCheck::Failed {
+            reason: format!("verification unavailable: {reason}"),
+        },
+    }
+}
+
+/// Print the policy outcome and propagate `Reject` as an error so the
+/// caller refuses to decrypt or surface the payload. `Accept` returns
+/// `Ok(())` and the caller continues to decryption.
+fn enforce_policy(
+    policy: SignaturePolicy,
+    outcome: &VerificationOutcome,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match policy.evaluate(outcome) {
+        PolicyAction::Accept => {
+            println!("signature_policy accept ({})", policy_label(policy));
+            Ok(())
+        }
+        PolicyAction::Reject { reason } => {
+            println!(
+                "signature_policy reject ({}): {}",
+                policy_label(policy),
+                reason
+            );
+            Err(format!("signature policy rejected envelope: {reason}").into())
+        }
+    }
+}
+
+/// Stable kebab-case label for human/log consumption — mirrors the
+/// CLI flag values so `--signature-policy require-pq` round-trips with
+/// the printed `signature_policy ... (require-pq)` line.
+fn policy_label(policy: SignaturePolicy) -> &'static str {
+    match policy {
+        SignaturePolicy::None => "none",
+        SignaturePolicy::BestEffort => "best-effort",
+        SignaturePolicy::RequireClassical => "require-classical",
+        SignaturePolicy::RequirePq => "require-pq",
+        SignaturePolicy::RequireBoth => "require-both",
     }
 }
 
@@ -694,6 +830,192 @@ mod tests {
         assert_eq!(envelopes[0].recipient_id.0, "amp:did:key:z6MkRecipient");
 
         fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    // ----- Issue aegit-cli#4: signature policy CLI flag -----
+    //
+    // The CLI flag is a thin mirror of `aegis_crypto::SignaturePolicy`. The
+    // core's evaluate() is exhaustively tested in aegis-crypto; here we
+    // verify the CLI-side wiring: enum mapping, label round-trip, the
+    // SignatureStatus → SignatureCheck adapter for the demo path, and that
+    // enforce_policy's Accept/Reject control flow is wired correctly.
+
+    fn outcome(c: SignatureCheck, p: SignatureCheck) -> VerificationOutcome {
+        VerificationOutcome {
+            classical: c,
+            pq: p,
+        }
+    }
+
+    fn failed(reason: &str) -> SignatureCheck {
+        SignatureCheck::Failed {
+            reason: reason.to_string(),
+        }
+    }
+
+    #[test]
+    fn signature_policy_arg_default_is_best_effort() {
+        let default = SignaturePolicyArg::default();
+        let policy: SignaturePolicy = default.into();
+        assert_eq!(policy, SignaturePolicy::BestEffort);
+    }
+
+    #[test]
+    fn signature_policy_arg_maps_all_variants() {
+        for (arg, expected) in [
+            (SignaturePolicyArg::None, SignaturePolicy::None),
+            (SignaturePolicyArg::BestEffort, SignaturePolicy::BestEffort),
+            (
+                SignaturePolicyArg::RequireClassical,
+                SignaturePolicy::RequireClassical,
+            ),
+            (SignaturePolicyArg::RequirePq, SignaturePolicy::RequirePq),
+            (
+                SignaturePolicyArg::RequireBoth,
+                SignaturePolicy::RequireBoth,
+            ),
+        ] {
+            let policy: SignaturePolicy = arg.into();
+            assert_eq!(policy, expected);
+        }
+    }
+
+    #[test]
+    fn policy_label_round_trips_kebab_case() {
+        assert_eq!(policy_label(SignaturePolicy::None), "none");
+        assert_eq!(policy_label(SignaturePolicy::BestEffort), "best-effort");
+        assert_eq!(
+            policy_label(SignaturePolicy::RequireClassical),
+            "require-classical"
+        );
+        assert_eq!(policy_label(SignaturePolicy::RequirePq), "require-pq");
+        assert_eq!(policy_label(SignaturePolicy::RequireBoth), "require-both");
+    }
+
+    #[test]
+    fn signature_status_to_check_maps_all_variants() {
+        assert_eq!(
+            signature_status_to_check(&SignatureStatus::Unsigned),
+            SignatureCheck::Absent
+        );
+        assert_eq!(
+            signature_status_to_check(&SignatureStatus::Verified),
+            SignatureCheck::Verified
+        );
+        match signature_status_to_check(&SignatureStatus::Failed("bad".to_string())) {
+            SignatureCheck::Failed { reason } => assert_eq!(reason, "bad"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        // Unavailable maps to Failed with a prefixed reason — present-but-
+        // unverified must not pass policy checks.
+        match signature_status_to_check(&SignatureStatus::Unavailable("no sender".to_string())) {
+            SignatureCheck::Failed { reason } => {
+                assert!(reason.starts_with("verification unavailable: "));
+                assert!(reason.contains("no sender"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enforce_policy_none_accepts_anything() {
+        // Even when both slots failed, --signature-policy none opens the
+        // envelope. The function prints a line; we just check the Result.
+        assert!(enforce_policy(SignaturePolicy::None, &outcome(failed("a"), failed("b"))).is_ok());
+    }
+
+    #[test]
+    fn enforce_policy_best_effort_accepts_both_verified() {
+        assert!(enforce_policy(
+            SignaturePolicy::BestEffort,
+            &outcome(SignatureCheck::Verified, SignatureCheck::Verified)
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn enforce_policy_best_effort_accepts_both_absent() {
+        assert!(enforce_policy(
+            SignaturePolicy::BestEffort,
+            &outcome(SignatureCheck::Absent, SignatureCheck::Absent)
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn enforce_policy_best_effort_rejects_present_failed() {
+        let err = enforce_policy(
+            SignaturePolicy::BestEffort,
+            &outcome(failed("bad"), SignatureCheck::Verified),
+        )
+        .expect_err("should reject");
+        assert!(err.to_string().contains("classical signature present"));
+    }
+
+    #[test]
+    fn enforce_policy_require_classical_rejects_when_classical_absent() {
+        let err = enforce_policy(
+            SignaturePolicy::RequireClassical,
+            &outcome(SignatureCheck::Absent, SignatureCheck::Verified),
+        )
+        .expect_err("should reject");
+        assert!(err.to_string().contains("classical signature required"));
+    }
+
+    #[test]
+    fn enforce_policy_require_classical_accepts_when_classical_verified_pq_absent() {
+        assert!(enforce_policy(
+            SignaturePolicy::RequireClassical,
+            &outcome(SignatureCheck::Verified, SignatureCheck::Absent)
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn enforce_policy_require_pq_rejects_when_pq_absent() {
+        let err = enforce_policy(
+            SignaturePolicy::RequirePq,
+            &outcome(SignatureCheck::Verified, SignatureCheck::Absent),
+        )
+        .expect_err("should reject");
+        assert!(err.to_string().contains("PQ signature required"));
+    }
+
+    #[test]
+    fn enforce_policy_require_pq_accepts_pq_verified_classical_absent() {
+        // The recommended v0.3+ deployment shape: classical is informational
+        // and the message can lack it entirely.
+        assert!(enforce_policy(
+            SignaturePolicy::RequirePq,
+            &outcome(SignatureCheck::Absent, SignatureCheck::Verified)
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn enforce_policy_require_both_rejects_when_either_missing() {
+        let err1 = enforce_policy(
+            SignaturePolicy::RequireBoth,
+            &outcome(SignatureCheck::Absent, SignatureCheck::Verified),
+        )
+        .expect_err("should reject");
+        assert!(err1.to_string().contains("classical signature required"));
+
+        let err2 = enforce_policy(
+            SignaturePolicy::RequireBoth,
+            &outcome(SignatureCheck::Verified, SignatureCheck::Absent),
+        )
+        .expect_err("should reject");
+        assert!(err2.to_string().contains("PQ signature required"));
+    }
+
+    #[test]
+    fn enforce_policy_require_both_accepts_when_both_verified() {
+        assert!(enforce_policy(
+            SignaturePolicy::RequireBoth,
+            &outcome(SignatureCheck::Verified, SignatureCheck::Verified)
+        )
+        .is_ok());
     }
 
     #[test]
