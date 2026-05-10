@@ -3,9 +3,9 @@ use std::fs;
 use aegis_crypto::HybridPqKeyBundle;
 use aegis_identity::{
     decode_local_dev_signing_key, generate_local_dev_signing_key_material, generate_prekey_bundle,
-    parse_identity_id, sign_prekey_bundle, HybridPqPrivateKeyMaterial, LocalDevSigningKeyMaterial,
-    PrekeyBundlePrivateMaterial, ALG_ED25519, ALG_MLDSA65, ALG_MLKEM768, ALG_X25519,
-    SUITE_HYBRID_PQ,
+    parse_identity_id, resolver::Resolver, sign_prekey_bundle, HybridPqPrivateKeyMaterial,
+    LocalDevSigningKeyMaterial, PrekeyBundlePrivateMaterial, ALG_ED25519, ALG_MLDSA65,
+    ALG_MLKEM768, ALG_X25519, SUITE_HYBRID_PQ,
 };
 use aegis_proto::{IdentityDocument, IdentityId, PublicKeyRecord};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -256,10 +256,8 @@ fn publish(args: PublishArgs) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(aegis_identity::resolver::publish_identity(
-        &args.relay,
-        &doc,
-    ))?;
+    let resolver = aegis_identity::resolver::HttpResolver::new(args.relay.as_str());
+    rt.block_on(resolver.publish_identity(&doc))?;
 
     println!("published {}", doc.identity_id.0);
     println!("relay     {}", args.relay);
@@ -317,10 +315,8 @@ fn publish_prekeys(args: PublishPrekeysArgs) -> Result<(), Box<dyn std::error::E
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(aegis_identity::resolver::publish_prekey_bundle(
-        &args.relay,
-        &bundle,
-    ))?;
+    let resolver = aegis_identity::resolver::HttpResolver::new(args.relay.as_str());
+    rt.block_on(resolver.publish_prekey_bundle(&bundle))?;
 
     println!("published_prekeys {}", bundle.identity_id.0);
     println!("relay             {}", args.relay);

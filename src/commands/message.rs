@@ -9,8 +9,9 @@ use aegis_crypto::{
     SignatureCheck, SignaturePolicy, VerificationOutcome,
 };
 use aegis_identity::{
-    decode_local_dev_signing_key, parse_identity_id, PrekeyBundlePrivateMaterial, ALG_ED25519,
-    ALG_MLDSA65, ALG_MLKEM768, ALG_X25519, SUITE_HYBRID_PQ,
+    decode_local_dev_signing_key, parse_identity_id, resolver::Resolver,
+    PrekeyBundlePrivateMaterial, ALG_ED25519, ALG_MLDSA65, ALG_MLKEM768, ALG_X25519,
+    SUITE_HYBRID_PQ,
 };
 use aegis_proto::{Envelope, IdentityId, MessageBody, PrivateHeaders, PrivatePayload, SuiteId};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -152,28 +153,27 @@ fn seal(mut args: SealArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Try local store first; fall back to relay if a URL is configured.
-    let recipient_doc_opt =
-        match resolved_recipient_doc.or_else(|| read_identity_document_opt(&recipient_id.0)) {
-            Some(doc) => Some(doc),
-            None => {
-                let relay_url = args.relay.clone();
-                match relay_url {
-                    Some(url) => {
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()?;
-                        Some(
-                            rt.block_on(aegis_identity::resolver::resolve_identity(
-                                &url,
-                                &recipient_id.0,
-                            ))
+    let recipient_doc_opt = match resolved_recipient_doc
+        .or_else(|| read_identity_document_opt(&recipient_id.0))
+    {
+        Some(doc) => Some(doc),
+        None => {
+            let relay_url = args.relay.clone();
+            match relay_url {
+                Some(url) => {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?;
+                    let resolver = aegis_identity::resolver::HttpResolver::new(url.as_str());
+                    Some(
+                        rt.block_on(resolver.resolve_identity(&recipient_id.0))
                             .map_err(|e| format!("could not resolve recipient identity: {}", e))?,
-                        )
-                    }
-                    None => None,
+                    )
                 }
+                None => None,
             }
-        };
+        }
+    };
 
     let recipient_doc = recipient_doc_opt;
     let supports_pq = recipient_doc
@@ -208,10 +208,8 @@ fn seal(mut args: SealArgs) -> Result<(), Box<dyn std::error::Error>> {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?;
-                match rt.block_on(aegis_identity::resolver::claim_one_time_prekey(
-                    relay_url,
-                    &recipient_id.0,
-                )) {
+                let resolver = aegis_identity::resolver::HttpResolver::new(relay_url.as_str());
+                match rt.block_on(resolver.claim_one_time_prekey(&recipient_id.0)) {
                     Ok(claimed) => {
                         if claimed.algorithm != ALG_MLKEM768 {
                             return Err(format!(
@@ -332,8 +330,27 @@ fn resolve_recipient_target(
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let doc = rt
-        .block_on(aegis_identity::resolver::resolve_alias(relay_url, to))
+    let resolver = aegis_identity::resolver::HttpResolver::new(relay_url);
+    rt.block_on(resolve_recipient_target_with(to, &resolver))
+}
+
+/// Resolver-aware variant of [`resolve_recipient_target`]. Pure async,
+/// generic over any [`Resolver`] impl. Fast-path for canonical
+/// `amp:did:key:` identifiers (returns without touching the resolver);
+/// otherwise calls `resolve_alias` on the resolver.
+///
+/// This is the **testable seam** for #5 — tests pass a `StaticResolver`
+/// to exercise alias-resolution behavior without any HTTP.
+async fn resolve_recipient_target_with<R: aegis_identity::resolver::Resolver>(
+    to: &str,
+    resolver: &R,
+) -> Result<(IdentityId, Option<aegis_proto::IdentityDocument>), Box<dyn std::error::Error>> {
+    if let Ok(id) = parse_identity_id(to) {
+        return Ok((id, None));
+    }
+    let doc = resolver
+        .resolve_alias(to)
+        .await
         .map_err(|e| format!("could not resolve recipient alias '{}': {}", to, e))?;
     Ok((doc.identity_id.clone(), Some(doc)))
 }
@@ -858,6 +875,95 @@ mod tests {
         SignatureCheck::Failed {
             reason: reason.to_string(),
         }
+    }
+
+    // ----- Issue aegit-cli#5: resolver-aware identity lookup -----
+    //
+    // The async helper resolve_recipient_target_with takes any
+    // `R: Resolver`, so tests use aegis_identity::resolver::StaticResolver
+    // (pure local, no HTTP). This validates the "tests for fallback
+    // behavior" acceptance criterion:
+    //
+    //   1. Canonical amp:did:key:* → short-circuit, never touch resolver
+    //   2. Alias known to resolver → resolved + returned with doc
+    //   3. Alias unknown to resolver → propagates ResolverError::NotFound
+    //      with a descriptive error message
+
+    use aegis_identity::resolver::StaticResolver;
+    use aegis_proto::IdentityDocument as ProtoDoc;
+
+    fn sample_identity_doc(id: &str, alias: &str) -> ProtoDoc {
+        ProtoDoc {
+            version: 1,
+            identity_id: IdentityId(id.to_string()),
+            aliases: vec![alias.to_string()],
+            signing_keys: vec![],
+            encryption_keys: vec![],
+            supported_suites: vec!["AMP-DEMO-XCHACHA20POLY1305".to_string()],
+            relay_endpoints: vec![],
+            signature: None,
+        }
+    }
+
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt")
+            .block_on(fut)
+    }
+
+    #[test]
+    fn resolve_recipient_target_with_canonical_id_short_circuits() {
+        let resolver = StaticResolver::new(); // never queried
+        let result = block_on(resolve_recipient_target_with(
+            "amp:did:key:z6MkCanonical",
+            &resolver,
+        ))
+        .expect("canonical id");
+        let (id, doc) = result;
+        assert_eq!(id.0, "amp:did:key:z6MkCanonical");
+        assert!(
+            doc.is_none(),
+            "no doc returned for canonical id; resolver was not called",
+        );
+    }
+
+    #[test]
+    fn resolve_recipient_target_with_alias_resolves_via_static_resolver() {
+        let doc = sample_identity_doc("amp:did:key:z6MkAlice", "alice@mesh");
+        let resolver = StaticResolver::new().with_alias("alice@mesh", doc.clone());
+        let (id, returned_doc) = block_on(resolve_recipient_target_with("alice@mesh", &resolver))
+            .expect("alias resolved");
+        assert_eq!(id.0, "amp:did:key:z6MkAlice");
+        let returned_doc = returned_doc.expect("doc returned");
+        assert_eq!(returned_doc.identity_id.0, "amp:did:key:z6MkAlice");
+    }
+
+    #[test]
+    fn resolve_recipient_target_with_unknown_alias_propagates_error() {
+        let resolver = StaticResolver::new();
+        let err = block_on(resolve_recipient_target_with("ghost@mesh", &resolver))
+            .expect_err("alias unknown");
+        let msg = err.to_string();
+        // Error wrapping preserved: descriptive message + alias name.
+        assert!(
+            msg.contains("could not resolve recipient alias 'ghost@mesh'"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_recipient_target_with_alias_returns_doc_for_caching() {
+        // The doc returned by alias resolution is what downstream code uses
+        // to discover supported_suites + encryption_keys. The Some(doc)
+        // path is the supports_pq → claim_prekey path; make sure we don't
+        // accidentally regress to None.
+        let doc = sample_identity_doc("amp:did:key:z6MkAlice", "alice@mesh");
+        let resolver = StaticResolver::new().with_alias("alice@mesh", doc);
+        let (_, returned) =
+            block_on(resolve_recipient_target_with("alice@mesh", &resolver)).expect("ok");
+        assert!(returned.is_some(), "alias path must return the doc");
     }
 
     #[test]

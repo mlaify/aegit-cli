@@ -4,6 +4,17 @@ All notable changes to this repository are documented here.
 
 ## [Unreleased]
 
+### Resolver-aware identity lookup (closes #5)
+
+- Wires the CLI through the new `aegis-identity::resolver::Resolver` trait (shipped in aegis-core PR #21). The five resolver call sites — `aegit msg seal` (alias resolution, identity resolution, prekey claim), `aegit id publish`, `aegit id publish-prekeys` — now construct an `HttpResolver` instance and go through trait methods instead of free functions. Behavior unchanged; behavior contract is now testable.
+- New testable async helper `resolve_recipient_target_with<R: Resolver>(to, resolver)` extracts the alias-resolution branch of `resolve_recipient_target`. The sync entry point still drives the seal command; the async helper is the seam.
+- 4 new pure-local tests use `aegis_identity::resolver::StaticResolver` (no HTTP) to validate fallback behavior:
+  - Canonical `amp:did:key:*` identifier short-circuits — resolver is never queried
+  - Known alias resolves and returns the cached doc for downstream PQ-suite detection
+  - Unknown alias surfaces a descriptive error mentioning the alias name
+  - The doc returned by an alias hit is `Some(...)` (regression guard for the supports_pq path)
+- Local-dev default behavior preserved: free-function wrappers in core are still valid; the CLI just now goes through `HttpResolver` directly so consumers reading the source can see the resolver-aware code path.
+
 ### Lifecycle output polish + error hints on `aegit relay ...` (closes #6)
 
 - Every relay subcommand now leads its stdout with a `status <verb>` line — `pushed` / `fetched` / `acknowledged` / `deleted` / `cleaned` — so quick-glance output answers "did it work?" first. Subsequent key=value lines are unchanged in spirit; some reordering for consistency.
